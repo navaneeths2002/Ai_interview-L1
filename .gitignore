@@ -1,0 +1,20 @@
+# Environment variables — never commit this
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Alembic
+alembic/versions/*.py
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI HR Assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+<style>
+/* ── Theme tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --bg:#EFF6FF; --sb:#FFFFFF; --card:#FFFFFF; --card2:#F8FAFC;
+  --bdr:#DBEAFE; --bdr2:#BFDBFE;
+  --pri:#2563EB; --pril:#3B82F6; --pribg:#EFF6FF;
+  --txt:#0F172A; --txt2:#1E3A5F; --mut:#64748B; --mutl:#93A8C4;
+  --ok:#CA8A04; --okl:#EAB308; --okbg:#FEFCE8;
+  --err:#EF4444; --warn:#F59E0B;
+  --ubub:#FEFCE8; --ubdr:#FDE047;
+  --abub:#FFFFFF; --abdr:#DBEAFE;
+  --shsm:0 1px 3px rgba(37,99,235,.06),0 1px 2px rgba(37,99,235,.04);
+  --shmd:0 4px 16px rgba(37,99,235,.10),0 2px 6px rgba(37,99,235,.05);
+  --font:'Inter',-apple-system,sans-serif;
+  --sw:222px; --rw:298px; --hh:70px;
+}
+[data-theme="dark"] {
+  --bg:#060C1A; --sb:#0A1322; --card:#0F1C30; --card2:#0A1525;
+  --bdr:#132240; --bdr2:#1A2E50;
+  --pri:#3B82F6; --pril:#60A5FA; --pribg:rgba(59,130,246,.1);
+  --txt:#EFF6FF; --txt2:#BFDBFE; --mut:#6B82A0; --mutl:#3D5475;
+  --ok:#EAB308; --okl:#FDE047; --okbg:rgba(234,179,8,.08);
+  --ubub:#1C1600; --ubdr:#78620A;
+  --abub:#0F1C30; --abdr:#132240;
+  --shsm:0 1px 4px rgba(0,0,0,.5);
+  --shmd:0 4px 22px rgba(0,0,0,.6);
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;font-family:var(--font);background:var(--bg);color:var(--txt);overflow:hidden;font-size:14px;}
+body{transition:background .25s,color .25s;}
+
+/* ── App grid ──────────────────────────────────────────────────────────────── */
+.app{display:grid;grid-template-columns:var(--sw) 1fr var(--rw);grid-template-rows:var(--hh) 1fr;height:100vh;}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────────── */
+.sidebar{grid-row:1/3;background:var(--sb);border-right:1px solid var(--bdr);display:flex;flex-direction:column;padding:16px 10px;transition:background .25s,border-color .25s;}
+.logo{display:flex;align-items:center;gap:10px;padding:4px 8px 20px;}
+.logo-ic{width:40px;height:40px;border-radius:10px;background:var(--pri);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 12px rgba(37,99,235,.4);}
+.logo-ic svg{width:22px;height:22px;}
+.logo-tx h2{font-size:13.5px;font-weight:700;line-height:1.2;}
+.logo-tx p{font-size:10.5px;color:var(--mut);margin-top:1px;}
+nav{display:flex;flex-direction:column;gap:2px;}
+.ni{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:9px;cursor:pointer;font-size:13px;font-weight:500;color:var(--mut);transition:all .15s;user-select:none;}
+.ni:hover{background:var(--pribg);color:var(--pri);}
+.ni.active{background:var(--pribg);color:var(--pri);font-weight:600;}
+.ni svg{width:17px;height:17px;flex-shrink:0;}
+.tip-card{margin-top:auto;background:var(--pribg);border:1px solid var(--bdr);border-radius:13px;padding:13px;margin-bottom:6px;}
+.tip-hd{display:flex;align-items:center;gap:8px;margin-bottom:7px;}
+.tip-ic{width:30px;height:30px;border-radius:8px;background:var(--okbg);border:1px solid rgba(234,179,8,.25);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.tip-ic svg{width:15px;height:15px;}
+.tip-ttl{font-size:12.5px;font-weight:600;}
+.tip-body{font-size:11.5px;color:var(--mut);line-height:1.6;}
+.tip-dots{display:flex;gap:4px;justify-content:center;margin-top:8px;}
+.tdot{width:6px;height:6px;border-radius:50%;background:var(--mutl);}
+.tdot.on{background:var(--pri);}
+.sb-bot{display:flex;flex-direction:column;gap:2px;margin-top:6px;}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);display:flex;align-items:center;padding:0 20px;gap:11px;transition:background .25s,border-color .25s;}
+.h-greet{flex:1;}
+.h-greet h1{font-size:18px;font-weight:700;}
+.h-greet p{font-size:11.5px;color:var(--mut);margin-top:2px;}
+.h-clock{display:flex;align-items:center;gap:8px;background:var(--card2);border:1px solid var(--bdr);border-radius:10px;padding:7px 13px;flex-shrink:0;}
+.h-clock svg{width:15px;height:15px;stroke:var(--pri);fill:none;stroke-width:2;}
+.h-ct{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;}
+.h-cd{font-size:10px;color:var(--mut);}
+.h-tz{display:flex;align-items:center;gap:5px;background:var(--card2);border:1px solid var(--bdr);border-radius:9px;padding:7px 11px;font-size:12.5px;font-weight:500;cursor:pointer;flex-shrink:0;}
+.h-tz svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;}
+.hbtn{width:35px;height:35px;border-radius:8px;background:var(--card2);border:1px solid var(--bdr);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .15s;position:relative;flex-shrink:0;}
+.hbtn:hover{background:var(--pribg);border-color:var(--pri);}
+.hbtn svg{width:17px;height:17px;stroke:var(--txt2);fill:none;stroke-width:2;}
+.nbadge{position:absolute;top:-5px;right:-5px;width:17px;height:17px;border-radius:50%;background:var(--pri);color:white;font-size:9.5px;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid var(--sb);}
+.h-user{display:flex;align-items:center;gap:7px;cursor:pointer;padding:5px 8px;border-radius:9px;transition:background .15s;flex-shrink:0;}
+.h-user:hover{background:var(--card2);}
+.h-av{width:33px;height:33px;border-radius:50%;background:var(--pri);color:white;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;}
+.h-uname{font-size:13px;font-weight:600;}
+.h-chev svg{width:13px;height:13px;stroke:var(--mut);fill:none;stroke-width:2;}
+
+/* ── Main ──────────────────────────────────────────────────────────────────── */
+.main{display:flex;gap:14px;padding:16px;overflow:hidden;}
+
+/* ── Chat card ─────────────────────────────────────────────────────────────── */
+.chat-card{flex:1;min-width:0;background:var(--card);border:1px solid var(--bdr);border-radius:15px;box-shadow:var(--shmd);display:flex;flex-direction:column;overflow:hidden;transition:background .25s,border-color .25s;}
+.chat-hdr{display:flex;align-items:center;padding:12px 17px;border-bottom:1px solid var(--bdr);gap:11px;flex-shrink:0;}
+.ch-bot{width:38px;height:38px;border-radius:50%;background:var(--pribg);border:2px solid var(--pri);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.ch-bot svg{width:19px;height:19px;}
+.ch-info h3{font-size:13.5px;font-weight:700;}
+.ch-status{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--okl);font-weight:500;margin-top:2px;}
+.online-dot{width:7px;height:7px;border-radius:50%;background:var(--okl);animation:bpulse 2s ease-in-out infinite;}
+@keyframes bpulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+.ch-timer{flex:1;text-align:center;}
+.ch-tval{font-size:21px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:1px;}
+.ch-tlbl{font-size:10px;color:var(--mut);margin-top:1px;}
+.btn-end{display:flex;align-items:center;gap:7px;background:rgba(239,68,68,.1);color:#DC2626;border:1px solid rgba(239,68,68,.22);border-radius:9px;padding:9px 15px;font-family:var(--font);font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;}
+.btn-end:hover:not(:disabled){background:rgba(239,68,68,.18);}
+.btn-end:disabled{opacity:.4;cursor:not-allowed;}
+.end-sq{width:11px;height:11px;background:#DC2626;border-radius:2px;flex-shrink:0;}
+[data-theme="dark"] .btn-end{color:#F87171;border-color:rgba(248,113,113,.22);}
+[data-theme="dark"] .end-sq{background:#F87171;}
+
+/* Chat body */
+.chat-body{flex:1;display:flex;gap:14px;padding:16px;overflow:hidden;min-height:0;}
+
+/* Avatar column */
+.av-col{width:198px;flex-shrink:0;display:flex;flex-direction:column;gap:11px;}
+.av-wrap{position:relative;width:192px;height:192px;flex-shrink:0;}
+/* Outer energy glow — state-driven, no spinning ring */
+.av-glow{position:absolute;inset:-10px;border-radius:50%;transition:box-shadow .5s ease;z-index:0;pointer-events:none;}
+.av-glow.idle   {box-shadow:0 0 0 1.5px rgba(59,130,246,.3),0 0 22px rgba(37,99,235,.22),0 0 55px rgba(37,99,235,.07);}
+.av-glow.speaking{animation:glow-beat .48s ease-in-out infinite alternate;}
+.av-glow.listening{box-shadow:0 0 0 2px rgba(234,179,8,.75),0 0 28px rgba(234,179,8,.7),0 0 65px rgba(234,179,8,.28);}
+.av-glow.thinking {box-shadow:0 0 0 1.5px rgba(234,179,8,.5),0 0 24px rgba(234,179,8,.45),0 0 60px rgba(234,179,8,.16);}
+@keyframes glow-beat{
+  from{box-shadow:0 0 0 2px rgba(96,165,250,.65),0 0 24px rgba(59,130,246,.75),0 0 60px rgba(59,130,246,.32),0 0 100px rgba(59,130,246,.12);}
+  to  {box-shadow:0 0 0 3px rgba(147,197,253,.92),0 0 42px rgba(59,130,246,1),0 0 100px rgba(59,130,246,.52),0 0 160px rgba(59,130,246,.22);}
+}
+#plasma-canvas{position:absolute;inset:0;border-radius:50%;z-index:1;pointer-events:none;}
+.av-intro{background:var(--abub);border:1px solid var(--abdr);border-radius:11px;padding:11px 12px;font-size:12px;color:var(--txt2);line-height:1.65;box-shadow:var(--shsm);}
+.av-intro-ts{font-size:10px;color:var(--mutl);margin-top:5px;text-align:right;}
+.ai-listen-box{display:none;align-items:center;gap:8px;background:var(--abub);border:1px solid var(--abdr);border-radius:11px;padding:9px 12px;font-size:11.5px;color:var(--mut);}
+.ai-listen-box.show{display:flex;}
+.wbars{display:flex;align-items:center;gap:2px;height:18px;}
+.wb{width:3px;border-radius:2px;background:var(--pri);transition:height .06s;}
+.wb:nth-child(1){height:5px;} .wb:nth-child(2){height:12px;} .wb:nth-child(3){height:8px;} .wb:nth-child(4){height:16px;} .wb:nth-child(5){height:6px;}
+
+/* Messages */
+.msgs{flex:1;min-width:0;overflow-y:auto;display:flex;flex-direction:column;gap:9px;}
+.msgs::-webkit-scrollbar{width:3px;}
+.msgs::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px;}
+.mrow{display:flex;align-items:flex-end;gap:7px;}
+.mrow.you{flex-direction:row-reverse;}
+.mrow.sys{justify-content:center;}
+.mrow.no-av .mav{visibility:hidden;}
+.mav{width:29px;height:29px;border-radius:50%;background:var(--pri);color:white;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.bwrap{display:flex;flex-direction:column;max-width:76%;}
+.mrow.you .bwrap{align-items:flex-end;}
+.bubble{padding:9px 12px;font-size:12.5px;line-height:1.65;border-radius:13px;word-break:break-word;}
+.mrow.ai .bubble{background:var(--abub);border:1px solid var(--abdr);border-bottom-left-radius:4px;color:var(--txt);box-shadow:var(--shsm);}
+.mrow.you .bubble{background:var(--ubub);border:1px solid var(--ubdr);border-bottom-right-radius:4px;color:var(--txt);}
+.mrow.sys .bubble{background:var(--pribg);border:1px solid var(--bdr);border-radius:7px;color:var(--pri);font-size:11px;padding:4px 12px;}
+.bubble.dim{opacity:.4;}
+.bt{font-size:9.5px;color:var(--mutl);margin-top:3px;padding:0 2px;}
+.typing-row{display:flex;align-items:center;gap:6px;background:var(--abub);border:1px solid var(--abdr);border-radius:13px;border-bottom-left-radius:4px;padding:9px 12px;font-size:12px;color:var(--mut);width:fit-content;}
+.tdots{display:flex;gap:3px;}
+.tdots span{width:7px;height:7px;border-radius:50%;background:var(--pri);animation:tdot .85s ease-in-out infinite;}
+.tdots span:nth-child(2){animation-delay:.17s;}
+.tdots span:nth-child(3){animation-delay:.34s;}
+@keyframes tdot{0%,60%,100%{transform:scale(.5);opacity:.3;}30%{transform:scale(1);opacity:1;}}
+.splash{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:9px;color:var(--mut);text-align:center;}
+.splash svg{width:38px;height:38px;stroke:var(--mutl);fill:none;stroke-width:1.5;}
+.splash p{font-size:14px;font-weight:600;color:var(--txt2);}
+.splash span{font-size:12px;}
+
+/* Live waveform bar */
+.wv-bar{flex-shrink:0;height:46px;border-top:1px solid var(--bdr);background:var(--card2);display:none;align-items:center;padding:0 16px;gap:9px;transition:background .25s;}
+.wv-bar.show{display:flex;}
+.wv-lbl{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mut);white-space:nowrap;}
+.wv-dot{width:7px;height:7px;border-radius:50%;background:var(--pri);animation:bpulse .7s ease-in-out infinite;}
+#wv-canvas{flex:1;height:32px;display:block;}
+
+/* Input footer */
+.chat-foot{flex-shrink:0;border-top:1px solid var(--bdr);padding:11px 15px 9px;background:var(--card);transition:background .25s,border-color .25s;}
+.irow{display:flex;align-items:center;gap:8px;background:var(--card2);border:1.5px solid var(--bdr);border-radius:11px;padding:8px 11px;transition:border-color .15s;}
+.irow:focus-within{border-color:var(--pri);}
+.cinput{flex:1;border:none;background:transparent;font-family:var(--font);font-size:13px;color:var(--txt);outline:none;}
+.cinput::placeholder{color:var(--mutl);}
+.btn-send{width:35px;height:35px;border-radius:9px;background:var(--pri);border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all .15s;}
+.btn-send:hover{background:var(--pril);transform:scale(1.05);}
+.btn-send:disabled{opacity:.4;cursor:not-allowed;transform:none;}
+.btn-send svg{width:15px;height:15px;fill:white;}
+.foot-hint{font-size:10.5px;color:var(--mutl);margin-top:5px;}
+.btn-start-full{width:100%;padding:10px;border-radius:9px;background:var(--pri);border:none;color:white;font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;transition:background .15s;margin-bottom:4px;}
+.btn-start-full:hover:not(:disabled){background:var(--pril);}
+.btn-start-full:disabled{opacity:.4;cursor:not-allowed;}
+
+/* ── Right panel ───────────────────────────────────────────────────────────── */
+.rpanel{width:var(--rw);flex-shrink:0;display:flex;flex-direction:column;gap:12px;overflow-y:auto;}
+.rpanel::-webkit-scrollbar{width:3px;}
+.rpanel::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px;}
+.rcard{background:var(--card);border:1px solid var(--bdr);border-radius:13px;padding:14px;box-shadow:var(--shsm);transition:background .25s,border-color .25s;}
+.rcard-ttl{font-size:13.5px;font-weight:700;margin-bottom:12px;}
+
+/* Progress ring */
+.pr-wrap{display:flex;align-items:flex-start;gap:13px;}
+.pr-svg{flex-shrink:0;}
+.pr-track{fill:none;stroke:var(--bdr);stroke-width:7;}
+.pr-fill{fill:none;stroke:url(#pr-grad);stroke-width:7;stroke-linecap:round;stroke-dasharray:220;stroke-dashoffset:220;transform:rotate(-90deg);transform-origin:50% 50%;transition:stroke-dashoffset .7s ease;}
+.pr-pct{font-size:17px;font-weight:700;fill:var(--txt);font-family:var(--font);}
+.pr-sublbl{font-size:9px;fill:var(--mut);font-family:var(--font);}
+.pr-stats{flex:1;display:flex;flex-direction:column;gap:0;}
+.pr-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--bdr);font-size:11.5px;}
+.pr-row:last-child{border:none;}
+.pr-row span:first-child{color:var(--mut);}
+.pr-row span:last-child{font-weight:600;}
+.pr-prog{height:4px;background:var(--bdr);border-radius:2px;margin-top:10px;overflow:hidden;}
+.pr-prog-fill{height:100%;background:linear-gradient(90deg,var(--pri),#EAB308);border-radius:2px;width:0%;transition:width .7s ease;}
+
+/* Q navigator */
+.q-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:8px;}
+.qb{aspect-ratio:1;border-radius:50%;border:1.5px solid var(--bdr2);font-size:11.5px;font-weight:500;color:var(--mut);display:flex;align-items:center;justify-content:center;transition:all .25s;cursor:default;}
+.qb.answered{border-color:var(--okl);color:var(--ok);background:var(--okbg);}
+.qb.current{border-color:var(--pri);background:var(--pri);color:white;font-weight:700;}
+.q-leg{display:flex;align-items:center;gap:11px;}
+.ql{display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--mut);}
+.ql-dot{width:7px;height:7px;border-radius:50%;}
+.ql-dot.a{background:var(--okl);}
+.ql-dot.c{background:var(--pri);}
+.ql-dot.u{background:var(--bdr2);}
+
+/* Guidelines */
+.gl{display:flex;align-items:center;gap:9px;padding:7px 0;border-bottom:1px solid var(--bdr);}
+.gl:last-child{border:none;}
+.gl-ic{width:27px;height:27px;border-radius:7px;background:var(--pribg);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.gl-ic svg{width:13px;height:13px;stroke:var(--pri);fill:none;stroke-width:2;}
+.gl span{font-size:12px;color:var(--txt2);}
+
+/* ── Overlay / Done ─────────────────────────────────────────────────────────── */
+.overlay{position:fixed;inset:0;z-index:50;background:rgba(5,10,20,.78);backdrop-filter:blur(10px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;opacity:0;pointer-events:none;transition:opacity .3s;}
+.overlay.show{opacity:1;pointer-events:all;}
+.ov-spin{width:54px;height:54px;border-radius:50%;border:3px solid rgba(59,130,246,.2);border-top-color:var(--pri);animation:spin .75s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.ov-title{font-size:15px;font-weight:600;color:white;}
+.ov-sub{font-size:12px;color:rgba(255,255,255,.5);}
+.done-scr{position:fixed;inset:0;z-index:60;background:rgba(5,10,20,.88);backdrop-filter:blur(18px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;opacity:0;pointer-events:none;transition:opacity .4s;}
+.done-scr.show{opacity:1;pointer-events:all;}
+.done-chk{width:66px;height:66px;border-radius:50%;background:rgba(234,179,8,.12);border:2px solid rgba(234,179,8,.45);display:flex;align-items:center;justify-content:center;animation:popin .5s cubic-bezier(.34,1.56,.64,1);}
+@keyframes popin{from{transform:scale(0);opacity:0;}}
+.done-chk svg{width:27px;height:27px;stroke:#EAB308;fill:none;stroke-width:2.5;}
+.done-title{font-size:22px;font-weight:700;color:white;}
+.done-sub{font-size:13px;color:rgba(255,255,255,.5);text-align:center;max-width:320px;line-height:1.65;}
+
+/* ── Mini Calendar panel ────────────────────────────────────────────────────── */
+.cal-panel{position:fixed;left:calc(var(--sw) + 8px);top:calc(var(--hh) + 8px);width:256px;background:var(--card);border:1px solid var(--bdr);border-radius:13px;box-shadow:var(--shmd);padding:14px;z-index:45;display:none;transition:background .25s,border-color .25s;}
+.cal-panel.show{display:block;animation:calfade .18s ease;}
+@keyframes calfade{from{opacity:0;transform:translateY(-6px);}to{opacity:1;transform:none;}}
+.cal-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;}
+.cal-month{font-size:13px;font-weight:700;}
+.cal-nav{width:27px;height:27px;border-radius:7px;background:var(--card2);border:1px solid var(--bdr);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .15s;}
+.cal-nav:hover{background:var(--pribg);border-color:var(--pri);}
+.cal-nav svg{width:13px;height:13px;stroke:var(--txt2);fill:none;stroke-width:2.5;}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;}
+.cal-dh{text-align:center;font-size:9.5px;font-weight:600;color:var(--mutl);padding:3px 0;}
+.cal-d{aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:11px;border-radius:6px;color:var(--txt2);}
+.cal-d.today{background:var(--pri);color:white;font-weight:700;border-radius:50%;}
+.cal-d.other{color:var(--mutl);}
+
+/* Remove chevron from header user since we stripped the dropdown */
+.h-chev{display:none;}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- ═══════════════ SIDEBAR ═══════════════ -->
+<aside class="sidebar">
+  <div class="logo">
+    <div class="logo-ic">
+      <svg viewBox="0 0 24 24" fill="white"><rect x="3" y="8" width="18" height="12" rx="3"/><circle cx="8.5" cy="14" r="1.5"/><circle cx="15.5" cy="14" r="1.5"/><path d="M7 8V6.5a5 5 0 0110 0V8" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+    </div>
+    <div class="logo-tx">
+      <h2>AI HR Assistant</h2>
+      <p>Your Interview Companion</p>
+    </div>
+  </div>
+
+  <nav>
+    <div class="ni active">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
+      Dashboard
+    </div>
+    <div class="ni" id="cal-btn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+      Calendar
+    </div>
+  </nav>
+
+  <!-- Mini calendar panel -->
+  <div id="cal-panel" class="cal-panel">
+    <div class="cal-hdr">
+      <div class="cal-nav" id="cal-prev"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></div>
+      <span id="cal-month-lbl" class="cal-month"></span>
+      <div class="cal-nav" id="cal-next"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></div>
+    </div>
+    <div class="cal-grid" id="cal-day-grid"></div>
+  </div>
+
+  <div class="tip-card">
+    <div class="tip-hd">
+      <div class="tip-ic">
+        <svg viewBox="0 0 24 24" fill="#F59E0B"><path d="M12 2a7 7 0 015.292 11.588A5 5 0 0115 17v1a2 2 0 01-2 2h-2a2 2 0 01-2-2v-1a5 5 0 01-2.292-3.412A7 7 0 0112 2z"/></svg>
+      </div>
+      <span class="tip-ttl">Interview Tip</span>
+    </div>
+    <p class="tip-body">Take your time, think clearly, and structure your answers.</p>
+    <div class="tip-dots">
+      <div class="tdot on"></div><div class="tdot"></div><div class="tdot"></div>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══════════════ HEADER ═══════════════ -->
+<header>
+  <div class="h-greet">
+    <h1 id="greeting">Good morning!</h1>
+    <p>You're all set for your interview. Stay confident and do your best!</p>
+  </div>
+  <div class="h-clock">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    <div>
+      <div id="h-time" class="h-ct">--:-- --</div>
+      <div id="h-date" class="h-cd">-- --- ----, ---</div>
+    </div>
+  </div>
+  <div class="hbtn" id="theme-btn" title="Toggle theme">
+    <svg id="theme-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+  </div>
+  <div class="h-user">
+    <div class="h-av" id="h-av">?</div>
+    <span class="h-uname" id="h-uname">Loading…</span>
+  </div>
+</header>
+
+<!-- ═══════════════ MAIN ═══════════════ -->
+<div class="main">
+
+  <!-- Chat card -->
+  <div class="chat-card">
+
+    <!-- Chat header bar -->
+    <div class="chat-hdr">
+      <div class="ch-bot">
+        <svg viewBox="0 0 24 24" fill="var(--pri)"><rect x="3" y="8" width="18" height="12" rx="3"/><circle cx="8.5" cy="14" r="1.5" fill="white"/><circle cx="15.5" cy="14" r="1.5" fill="white"/><path d="M7 8V6.5a5 5 0 0110 0V8" stroke="var(--pri)" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+      </div>
+      <div class="ch-info">
+        <h3>AI HR Interviewer</h3>
+        <div class="ch-status"><div class="online-dot"></div><span id="conn-lbl">Ready</span></div>
+      </div>
+      <div class="ch-timer">
+        <div id="timer" class="ch-tval">00:00:00</div>
+        <div class="ch-tlbl">Interview Duration</div>
+      </div>
+      <button id="endBtn" class="btn-end" disabled>
+        <div class="end-sq"></div>End Interview
+      </button>
+    </div>
+
+    <!-- Chat body: avatar col + messages -->
+    <div class="chat-body">
+
+      <!-- Avatar column -->
+      <div class="av-col">
+        <div class="av-wrap" id="av-wrap">
+          <div id="av-glow" class="av-glow idle"></div>
+          <canvas id="plasma-canvas"></canvas>
+          <!-- Simli live avatar video — shown when avatar track arrives, hides canvas -->
+          <video id="avatar-video" autoplay playsinline muted
+                 style="position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:cover;z-index:2;display:none;background:#000;"></video>
+        </div>
+        <div class="av-intro">
+          Hello! I'm your AI HR interviewer. I'll be asking you a series of questions to understand your skills and experience.
+          <div class="av-intro-ts" id="av-ts">--:--</div>
+        </div>
+        <div class="ai-listen-box" id="ai-listen">
+          <div class="wbars">
+            <div class="wb" id="wb1"></div><div class="wb" id="wb2"></div>
+            <div class="wb" id="wb3"></div><div class="wb" id="wb4"></div>
+            <div class="wb" id="wb5"></div>
+          </div>
+          <span>AI is listening...</span>
+        </div>
+      </div>
+
+      <!-- Messages -->
+      <div class="msgs" id="msgs">
+        <div class="splash" id="splash">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+          <p>Ready to Start</p>
+          <span>Click Start Interview to begin your session</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live waveform bar -->
+    <div class="wv-bar" id="wv-bar">
+      <div class="wv-lbl"><div class="wv-dot" id="wv-dot"></div><span id="wv-lbl">Sarah is speaking</span></div>
+      <canvas id="wv-canvas"></canvas>
+    </div>
+
+    <!-- Input footer -->
+    <div class="chat-foot">
+      <div id="start-wrap">
+        <button id="startBtn" class="btn-start-full">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;display:inline-block;vertical-align:middle;margin-right:7px;margin-top:-2px;"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0014 0"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>Start Interview
+        </button>
+      </div>
+      <div id="input-wrap" style="display:none">
+        <div class="irow">
+          <input id="cinput" class="cinput" type="text" placeholder="Type your response here..." disabled/>
+          <button class="btn-send" disabled>
+            <svg viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2L15 22 11 13 2 9l20-7z"/></svg>
+          </button>
+        </div>
+        <div class="foot-hint">Press Enter to send</div>
+      </div>
+    </div>
+  </div><!-- /chat-card -->
+
+  <!-- Right panel -->
+  <div class="rpanel">
+
+    <!-- Interview Progress -->
+    <div class="rcard">
+      <div class="rcard-ttl">Interview Progress</div>
+      <div class="pr-wrap">
+        <svg class="pr-svg" width="88" height="88" viewBox="0 0 88 88">
+          <defs>
+            <linearGradient id="pr-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#2563EB"/>
+              <stop offset="100%" stop-color="#EAB308"/>
+            </linearGradient>
+          </defs>
+          <circle class="pr-track" cx="44" cy="44" r="35"/>
+          <circle id="pr-fill" class="pr-fill" cx="44" cy="44" r="35"/>
+          <text id="pr-pct" class="pr-pct" x="44" y="47" text-anchor="middle" dominant-baseline="middle">0%</text>
+          <text class="pr-sublbl" x="44" y="59" text-anchor="middle">Completed</text>
+        </svg>
+        <div class="pr-stats">
+          <div class="pr-row"><span>Questions</span><span id="pr-q">0 / 7</span></div>
+          <div class="pr-row"><span>Answered</span><span id="pr-a">0</span></div>
+          <div class="pr-row"><span>Remaining</span><span id="pr-r">7</span></div>
+          <div class="pr-row"><span>Est. Time</span><span>30 Min</span></div>
+        </div>
+      </div>
+      <div class="pr-prog"><div id="pr-bar" class="pr-prog-fill"></div></div>
+    </div>
+
+    <!-- Question Navigator -->
+    <div class="rcard">
+      <div class="rcard-ttl">Question Navigator</div>
+      <div class="q-grid" id="q-grid"></div>
+      <div class="q-leg">
+        <div class="ql"><div class="ql-dot a"></div>Answered</div>
+        <div class="ql"><div class="ql-dot c"></div>Current</div>
+        <div class="ql"><div class="ql-dot u"></div>Upcoming</div>
+      </div>
+    </div>
+
+    <!-- Interview Guidelines -->
+    <div class="rcard">
+      <div class="rcard-ttl">Interview Guidelines</div>
+      <div class="gl">
+        <div class="gl-ic"><svg viewBox="0 0 24 24"><path d="M9 19V6l12-3v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="15" r="3"/></svg></div>
+        <span>Ensure a quiet environment</span>
+      </div>
+      <div class="gl">
+        <div class="gl-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+        <span>Take your time to think</span>
+      </div>
+      <div class="gl">
+        <div class="gl-ic"><svg viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
+        <span>Be honest and confident</span>
+      </div>
+      <div class="gl">
+        <div class="gl-ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
+        <span>You can ask for clarification</span>
+      </div>
+    </div>
+
+  </div><!-- /rpanel -->
+</div><!-- /main -->
+</div><!-- /app -->
+
+<!-- Overlay -->
+<div id="overlay" class="overlay">
+  <div class="ov-spin"></div>
+  <div class="ov-title">Connecting to AI Interviewer</div>
+  <div class="ov-sub">Establishing secure voice channel…</div>
+</div>
+
+<!-- Done screen -->
+<div id="done-scr" class="done-scr">
+  <div class="done-chk"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+  <div class="done-title">Interview Complete</div>
+  <div class="done-sub">Thank you for your time. Our team will review your profile and reach out to you shortly.</div>
+</div>
+
+<script>
+'use strict';
+const interviewId = location.pathname.split('/').filter(Boolean).pop();
+let room = null;
+let cachedTokenData = null; // prefetched on load, reused on Start
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+const html = document.documentElement;
+const themeBtn  = document.getElementById('theme-btn');
+const themeIcon = document.getElementById('theme-icon');
+const MOON_SVG = `<path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>`;
+const SUN_SVG  = `<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>`;
+let darkMode = false;
+themeBtn.onclick = () => {
+  darkMode = !darkMode;
+  html.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+  themeIcon.innerHTML = darkMode ? MOON_SVG : SUN_SVG;
+};
+
+// ── Prefetch interview info → candidate name ──────────────────────────────────
+(async function prefetchInterviewInfo() {
+  try {
+    const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
+    if (!res.ok) return;
+    cachedTokenData = await res.json();
+    const name     = cachedTokenData.candidate_name || 'Candidate';
+    const initials = name.trim().split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase();
+    document.getElementById('h-uname').textContent = name;
+    document.getElementById('h-av').textContent    = initials || '?';
+  } catch (e) {
+    document.getElementById('h-uname').textContent = 'Candidate';
+    document.getElementById('h-av').textContent    = 'C';
+  }
+})();
+
+// ── Mini Calendar ─────────────────────────────────────────────────────────────
+let calDate  = new Date();
+const calPanel = document.getElementById('cal-panel');
+const calBtn   = document.getElementById('cal-btn');
+
+calBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  calPanel.classList.toggle('show');
+  if (calPanel.classList.contains('show')) renderCal();
+});
+document.addEventListener('click', e => {
+  if (!calPanel.contains(e.target) && !calBtn.contains(e.target))
+    calPanel.classList.remove('show');
+});
+
+const MONTH_NAMES = ['January','February','March','April','May','June',
+                     'July','August','September','October','November','December'];
+function renderCal() {
+  const y = calDate.getFullYear(), m = calDate.getMonth();
+  const today = new Date();
+  document.getElementById('cal-month-lbl').textContent = MONTH_NAMES[m] + ' ' + y;
+  const grid = document.getElementById('cal-day-grid');
+  grid.innerHTML = '';
+  // Day-of-week headers
+  ['Su','Mo','Tu','We','Th','Fr','Sa'].forEach(d => {
+    const el = document.createElement('div'); el.className = 'cal-dh'; el.textContent = d;
+    grid.appendChild(el);
+  });
+  const firstDay    = new Date(y, m, 1).getDay();
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  // Leading empty cells
+  for (let i = 0; i < firstDay; i++) {
+    const el = document.createElement('div'); el.className = 'cal-d'; grid.appendChild(el);
+  }
+  // Day cells
+  for (let d = 1; d <= daysInMonth; d++) {
+    const el = document.createElement('div');
+    const isToday = today.getFullYear()===y && today.getMonth()===m && today.getDate()===d;
+    el.className = 'cal-d' + (isToday ? ' today' : '');
+    el.textContent = d;
+    grid.appendChild(el);
+  }
+}
+document.getElementById('cal-prev').addEventListener('click', e => {
+  e.stopPropagation();
+  calDate = new Date(calDate.getFullYear(), calDate.getMonth() - 1, 1);
+  renderCal();
+});
+document.getElementById('cal-next').addEventListener('click', e => {
+  e.stopPropagation();
+  calDate = new Date(calDate.getFullYear(), calDate.getMonth() + 1, 1);
+  renderCal();
+});
+
+// ── Clock + greeting ──────────────────────────────────────────────────────────
+const DAYS   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function updateClock() {
+  const n = new Date();
+  const h = n.getHours(), m = n.getMinutes(), s = n.getSeconds();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 || 12;
+  document.getElementById('h-time').textContent =
+    `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm}`;
+  document.getElementById('h-date').textContent =
+    `${n.getDate()} ${MONTHS[n.getMonth()]} ${n.getFullYear()}, ${DAYS[n.getDay()].slice(0,3)}`;
+  const g = h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening';
+  document.getElementById('greeting').textContent = `Good ${g}!`;
+  document.getElementById('av-ts').textContent =
+    `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm}`;
+}
+updateClock();
+setInterval(updateClock, 1000);
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+let tSecs = 0, tInt = null;
+function startTimer() {
+  tInt = setInterval(() => {
+    tSecs++;
+    const hh = Math.floor(tSecs/3600), mm = Math.floor((tSecs%3600)/60), ss = tSecs%60;
+    document.getElementById('timer').textContent =
+      `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+  }, 1000);
+}
+function stopTimer() { clearInterval(tInt); }
+function pad(n) { return String(n).padStart(2,'0'); }
+
+// ── Question Navigator (7 stages) ─────────────────────────────────────────────
+const STAGE_LABELS = ['Intro','Experience','Current CTC','Expected CTC','Notice Period','Relocation','Joining'];
+let curStage = 0, answeredCnt = 0;
+
+(function buildQNav() {
+  const g = document.getElementById('q-grid');
+  for (let i = 0; i < 7; i++) {
+    const b = document.createElement('div');
+    b.className = 'qb' + (i === 0 ? ' current' : '');
+    b.textContent = i + 1;
+    b.id = 'qb' + i;
+    b.title = STAGE_LABELS[i];
+    g.appendChild(b);
+  }
+})();
+
+function advanceStage(idx) {
+  if (idx <= curStage) return;
+  for (let i = curStage; i < idx; i++) {
+    const b = document.getElementById('qb' + i);
+    if (b) { b.className = 'qb answered'; answeredCnt++; }
+  }
+  curStage = idx;
+  const cur = document.getElementById('qb' + idx);
+  if (cur) cur.className = 'qb current';
+  updateProgress(answeredCnt, 7);
+}
+
+function updateProgress(done, total) {
+  const pct = Math.round((done / total) * 100);
+  const circ = 220;
+  document.getElementById('pr-fill').style.strokeDashoffset = circ - (circ * pct / 100);
+  document.getElementById('pr-pct').textContent = pct + '%';
+  document.getElementById('pr-q').textContent = done + ' / ' + total;
+  document.getElementById('pr-a').textContent = done;
+  document.getElementById('pr-r').textContent = total - done;
+  document.getElementById('pr-bar').style.width = pct + '%';
+}
+
+function allDone() {
+  for (let i = 0; i < 7; i++) {
+    const b = document.getElementById('qb' + i);
+    if (b) b.className = 'qb answered';
+  }
+  updateProgress(7, 7);
+}
+
+// ── Stage detection (maps AI speech to stages) ────────────────────────────────
+const STAGE_KEYS = [
+  ['introduction','tell me about','brief intro','yourself','about you'],
+  ['experience','years','how long','worked'],
+  ['current ctc','current salary','earning','currently'],
+  ['expected','expecting','looking for','salary expectation'],
+  ['notice','serving notice','relieving','buyout'],
+  ['relocat','move to','open to','location','city'],
+  ['join','earliest','available','start date'],
+];
+function checkStage(txt) {
+  const t = txt.toLowerCase();
+  for (let i = curStage; i < STAGE_KEYS.length; i++) {
+    if (STAGE_KEYS[i].some(k => t.includes(k))) { advanceStage(i); break; }
+  }
+}
+
+// ── Plasma canvas — deep-space background + live particles ───────────────────
+const plasmaEl  = document.getElementById('plasma-canvas');
+const plasmaCtx = plasmaEl.getContext('2d');
+let plasmaMode  = 'idle';
+let plasmaT     = 0;
+
+function resizePlasma() {
+  const sz = document.getElementById('av-wrap').offsetWidth || 192;
+  plasmaEl.width = sz; plasmaEl.height = sz;
+}
+resizePlasma();
+window.addEventListener('resize', resizePlasma);
+
+// Floating particle field — orbits in the visible ring around the photo
+const PTCL_COUNT = 36;
+const ptcls = Array.from({length: PTCL_COUNT}, () => ({
+  a:  Math.random() * Math.PI * 2,        // angle
+  r:  0.32 + Math.random() * 0.62,        // normalised radius — full circle spread
+  sz: 0.6  + Math.random() * 1.9,         // dot radius px
+  sp: (0.0010 + Math.random() * 0.0025) * (Math.random()<.5?1:-1), // angular speed ±
+  op: 0.18 + Math.random() * 0.50,        // base opacity
+  dr: (Math.random() - 0.5) * 0.0005,    // radial drift
+  hOff: Math.random() * 45,              // hue offset for colour variety
+}));
+
+// State → hue / bg colours
+const STATE_CFG = {
+  idle:      { hue:215, bgA:'rgba(8,14,38,1)',  bgB:'rgba(6,11,32,1)',  bgC:'rgba(12,18,48,1)',  ptAlpha:.7  },
+  speaking:  { hue:210, bgA:'rgba(8,18,52,1)',  bgB:'rgba(6,15,48,1)',  bgC:'rgba(14,24,68,1)',  ptAlpha:1   },
+  listening: { hue:48,  bgA:'rgba(24,18,4,1)',  bgB:'rgba(20,15,3,1)',  bgC:'rgba(32,24,6,1)',   ptAlpha:1   },
+  thinking:  { hue:44,  bgA:'rgba(26,18,4,1)',  bgB:'rgba(22,15,3,1)',  bgC:'rgba(34,22,6,1)',   ptAlpha:.85 },
+};
+
+function drawPlasma() {
+  plasmaT += 0.018;
+  const w = plasmaEl.width, h = plasmaEl.height;
+  const cx = w/2, cy = h/2, R = w/2;
+  plasmaCtx.clearRect(0, 0, w, h);
+  const cfg = STATE_CFG[plasmaMode] || STATE_CFG.idle;
+
+  // ── 1. Deep-space background ──────────────────────────────────────────────
+  const bg = plasmaCtx.createRadialGradient(cx, cy*0.7, 0, cx, cy, R);
+  bg.addColorStop(0,   cfg.bgA);
+  bg.addColorStop(0.5, cfg.bgB);
+  bg.addColorStop(1,   cfg.bgC);
+  plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, R, 0, Math.PI*2);
+  plasmaCtx.fillStyle = bg; plasmaCtx.fill();
+
+  // ── 2. Ambient inner glow ─────────────────────────────────────────────────
+  const glowAlpha = plasmaMode === 'idle' ? 0.14 : 0.28;
+  const gInner = plasmaCtx.createRadialGradient(cx, cy, R*0.30, cx, cy, R*0.92);
+  gInner.addColorStop(0,   `hsla(${cfg.hue},100%,68%,0)`);
+  gInner.addColorStop(0.65, `hsla(${cfg.hue},100%,62%,${glowAlpha})`);
+  gInner.addColorStop(1,    `hsla(${cfg.hue},100%,55%,${glowAlpha*0.45})`);
+  plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, R, 0, Math.PI*2);
+  plasmaCtx.fillStyle = gInner; plasmaCtx.fill();
+
+  // ── 3. Speaking: animated energy bands ───────────────────────────────────
+  if (plasmaMode === 'speaking') {
+    for (let i = 0; i < 3; i++) {
+      const phase = plasmaT * 2.6 + i * (Math.PI*2/3);
+      const pr = R * (0.80 + Math.sin(phase) * 0.06);
+      const eg = plasmaCtx.createRadialGradient(cx, cy, pr*0.86, cx, cy, pr);
+      eg.addColorStop(0, 'rgba(96,165,250,0)');
+      eg.addColorStop(0.55, `rgba(96,165,250,${0.3 + Math.sin(phase)*0.12})`);
+      eg.addColorStop(1, 'rgba(96,165,250,0)');
+      plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, pr, 0, Math.PI*2);
+      plasmaCtx.fillStyle = eg; plasmaCtx.fill();
+    }
+  }
+
+  // ── 4. Listening: yellow ripple rings ────────────────────────────────────
+  if (plasmaMode === 'listening') {
+    for (let i = 0; i < 2; i++) {
+      const rr = R * (0.78 + Math.sin(plasmaT*1.6 + i*1.1) * 0.055);
+      const lg = plasmaCtx.createRadialGradient(cx, cy, rr*0.86, cx, cy, rr);
+      lg.addColorStop(0, 'rgba(234,179,8,0)');
+      lg.addColorStop(0.5, 'rgba(234,179,8,.42)');
+      lg.addColorStop(1, 'rgba(234,179,8,0)');
+      plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, rr, 0, Math.PI*2);
+      plasmaCtx.fillStyle = lg; plasmaCtx.fill();
+    }
+  }
+
+  // ── 5. Thinking: amber pulse ──────────────────────────────────────────────
+  if (plasmaMode === 'thinking') {
+    const pulse = Math.sin(plasmaT * 2.2) * 0.05;
+    const tg = plasmaCtx.createRadialGradient(cx, cy, R*(0.70+pulse), cx, cy, R);
+    tg.addColorStop(0, 'rgba(245,158,11,0)');
+    tg.addColorStop(0.5, 'rgba(245,158,11,.35)');
+    tg.addColorStop(1, 'rgba(245,158,11,.1)');
+    plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, R, 0, Math.PI*2);
+    plasmaCtx.fillStyle = tg; plasmaCtx.fill();
+  }
+
+  // ── 6. Floating particles (star-field across full circle) ────────────────
+  ptcls.forEach(p => {
+    p.a += p.sp;
+    p.r += p.dr;
+    if (p.r > 0.95 || p.r < 0.12) { p.dr *= -1; }
+
+    const px = cx + Math.cos(p.a) * p.r * R;
+    const py = cy + Math.sin(p.a) * p.r * R;
+    const flicker = 0.7 + Math.sin(plasmaT * 3.5 + p.a * 7) * 0.3;
+    const alpha = p.op * cfg.ptAlpha * flicker;
+    const hue   = cfg.hue + p.hOff * 0.4 + Math.sin(plasmaT + p.a) * 18;
+    const lum   = 78 + Math.sin(plasmaT * 2 + p.a) * 12;
+
+    const dotG = plasmaCtx.createRadialGradient(px, py, 0, px, py, p.sz * 3);
+    dotG.addColorStop(0,   `hsla(${hue},100%,${lum}%,${alpha})`);
+    dotG.addColorStop(0.5, `hsla(${hue},100%,${lum}%,${alpha*0.45})`);
+    dotG.addColorStop(1,   `hsla(${hue},100%,${lum}%,0)`);
+    plasmaCtx.beginPath();
+    plasmaCtx.arc(px, py, p.sz * 3, 0, Math.PI * 2);
+    plasmaCtx.fillStyle = dotG;
+    plasmaCtx.fill();
+  });
+
+  // ── 7. Centre AI orb ─────────────────────────────────────────────────────
+  // Soft glowing core
+  const coreR = R * 0.28;
+  const corePulse = 1 + Math.sin(plasmaT * 1.8) * 0.06;
+  const coreG = plasmaCtx.createRadialGradient(cx, cy, 0, cx, cy, coreR * corePulse * 1.6);
+  coreG.addColorStop(0,    `hsla(${cfg.hue},100%,88%,0.92)`);
+  coreG.addColorStop(0.35, `hsla(${cfg.hue},100%,72%,0.65)`);
+  coreG.addColorStop(0.7,  `hsla(${cfg.hue},100%,60%,0.22)`);
+  coreG.addColorStop(1,    `hsla(${cfg.hue},100%,55%,0)`);
+  plasmaCtx.beginPath();
+  plasmaCtx.arc(cx, cy, coreR * corePulse * 1.6, 0, Math.PI * 2);
+  plasmaCtx.fillStyle = coreG;
+  plasmaCtx.fill();
+
+  // AI bot icon drawn with canvas paths
+  const ic = coreR * 0.54;   // icon scale
+  const ix = cx, iy = cy;
+  plasmaCtx.save();
+  plasmaCtx.translate(ix, iy);
+  const iconColor = `hsla(${cfg.hue + 30},100%,96%,0.95)`;
+  plasmaCtx.strokeStyle = iconColor;
+  plasmaCtx.fillStyle   = iconColor;
+  plasmaCtx.lineWidth   = ic * 0.12;
+  plasmaCtx.lineCap     = 'round';
+  plasmaCtx.lineJoin    = 'round';
+  // Robot head body
+  const bw = ic*1.1, bh = ic*0.85, br = ic*0.18;
+  const bx = -bw/2, by = -bh/2 + ic*0.08;
+  plasmaCtx.beginPath();
+  plasmaCtx.roundRect(bx, by, bw, bh, br);
+  plasmaCtx.stroke();
+  // Eyes
+  plasmaCtx.beginPath(); plasmaCtx.arc(-ic*0.28, ic*0.04, ic*0.11, 0, Math.PI*2); plasmaCtx.fill();
+  plasmaCtx.beginPath(); plasmaCtx.arc( ic*0.28, ic*0.04, ic*0.11, 0, Math.PI*2); plasmaCtx.fill();
+  // Antenna
+  plasmaCtx.beginPath();
+  plasmaCtx.moveTo(0, by);
+  plasmaCtx.lineTo(0, by - ic*0.32);
+  plasmaCtx.stroke();
+  plasmaCtx.beginPath(); plasmaCtx.arc(0, by - ic*0.32, ic*0.1, 0, Math.PI*2); plasmaCtx.fill();
+  plasmaCtx.restore();
+
+  requestAnimationFrame(drawPlasma);
+}
+drawPlasma();
+
+// ── Live waveform visualizer (bottom bar) ─────────────────────────────────────
+const wvCanvas = document.getElementById('wv-canvas');
+const wvCtx    = wvCanvas.getContext('2d');
+let wvAnalyser = null, wvMode = 'hidden';
+
+function drawWaveform() {
+  requestAnimationFrame(drawWaveform);
+  const bar = document.getElementById('wv-bar');
+  const W = bar.clientWidth - 130;
+  wvCanvas.width  = Math.max(W, 10);
+  wvCanvas.height = 32;
+  wvCtx.clearRect(0, 0, wvCanvas.width, 32);
+  if (wvMode === 'hidden' || !wvAnalyser) return;
+
+  const data = new Uint8Array(wvAnalyser.frequencyBinCount);
+  wvAnalyser.getByteFrequencyData(data);
+  const bw = 3, gap = 2, cnt = Math.floor(wvCanvas.width/(bw+gap));
+  const mid = 16;
+  const col = wvMode === 'listening' ? '234,179,8' : '37,99,235';
+  for (let i = 0; i < cnt; i++) {
+    const v = data[Math.floor(i*data.length/cnt)] / 255;
+    const bh = Math.max(2, v * 28);
+    const x = i*(bw+gap);
+    const grd = wvCtx.createLinearGradient(x, mid-bh/2, x, mid+bh/2);
+    grd.addColorStop(0, `rgba(${col},.35)`);
+    grd.addColorStop(.5,`rgba(${col},1)`);
+    grd.addColorStop(1, `rgba(${col},.35)`);
+    wvCtx.fillStyle = grd;
+    wvCtx.beginPath();
+    wvCtx.roundRect(x, mid-bh/2, bw, bh, 1.5);
+    wvCtx.fill();
+  }
+}
+drawWaveform();
+
+// ── AI audio hook (connects to waveform + plasma) ─────────────────────────────
+let aiACtx = null;
+function hookAI(el) {
+  try {
+    if (!aiACtx) aiACtx = new (window.AudioContext||window.webkitAudioContext)();
+    const src = aiACtx.createMediaElementSource(el);
+    const an  = aiACtx.createAnalyser();
+    an.fftSize = 128; an.smoothingTimeConstant = .82;
+    src.connect(an); an.connect(aiACtx.destination);
+    wvAnalyser = an;
+    (function tick() {
+      const d = new Uint8Array(an.frequencyBinCount);
+      an.getByteFrequencyData(d);
+      const avg = d.reduce((a,b)=>a+b,0)/d.length/255;
+      if (avg > .03) setAvatarMode('speaking');
+      else if (plasmaMode === 'speaking') setAvatarMode('idle');
+      requestAnimationFrame(tick);
+    })();
+  } catch(e) {}
+}
+
+// ── Mic hook (drives listening bars) ─────────────────────────────────────────
+let micCtx = null;
+function hookMic(stream) {
+  try {
+    micCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const src = micCtx.createMediaStreamSource(stream);
+    const an  = micCtx.createAnalyser();
+    an.fftSize = 64; an.smoothingTimeConstant = .65;
+    src.connect(an);
+    const bars = [document.getElementById('wb1'),document.getElementById('wb2'),
+                  document.getElementById('wb3'),document.getElementById('wb4'),
+                  document.getElementById('wb5')];
+    (function tick() {
+      requestAnimationFrame(tick);
+      const d = new Uint8Array(an.frequencyBinCount);
+      an.getByteFrequencyData(d);
+      bars.forEach((b,i) => {
+        const v = d[Math.floor(i*(d.length/bars.length))]/255;
+        if (b) b.style.height = (4 + v * 18) + 'px';
+      });
+    })();
+  } catch(e) {}
+}
+
+// ── Avatar mode ───────────────────────────────────────────────────────────────
+function setAvatarMode(mode) {
+  plasmaMode = mode;
+  const glow    = document.getElementById('av-glow');
+  const wvBar   = document.getElementById('wv-bar');
+  const wvDot   = document.getElementById('wv-dot');
+  const wvLbl   = document.getElementById('wv-lbl');
+  const listenBox = document.getElementById('ai-listen');
+
+  // Update glow ring class — drives CSS box-shadow animation
+  if (glow) glow.className = 'av-glow ' + (mode || 'idle');
+
+  if (mode === 'speaking') {
+    wvMode = 'speaking';
+    wvBar.classList.add('show');
+    if (wvDot) wvDot.style.background = 'var(--pri)';
+    if (wvLbl) wvLbl.textContent = 'Sarah is speaking';
+    listenBox.classList.remove('show');
+  } else if (mode === 'listening') {
+    wvMode = 'listening';
+    wvBar.classList.add('show');
+    if (wvDot) wvDot.style.background = 'var(--ok)';
+    if (wvLbl) wvLbl.textContent = 'Listening to you';
+    listenBox.classList.add('show');
+  } else if (mode === 'thinking') {
+    wvMode = 'hidden';
+    wvBar.classList.remove('show');
+    listenBox.classList.remove('show');
+  } else {
+    wvMode = 'hidden';
+    wvBar.classList.remove('show');
+    listenBox.classList.remove('show');
+  }
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+function setConnLabel(txt) { document.getElementById('conn-lbl').textContent = txt; }
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+let lastRole = null;
+const interim = {};
+function ts() { return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function addMsg(role, text, dim=false) {
+  const box = document.getElementById('msgs');
+  const sp  = document.getElementById('splash');
+  if (sp) sp.remove();
+  const same = (lastRole === role && role !== 'sys');
+  lastRole = role;
+  const row = document.createElement('div');
+  row.className = 'mrow ' + role + (same ? ' no-av' : '');
+  if (role === 'sys') {
+    row.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+  } else {
+    const av = `<div class="mav">${role==='ai'?'AI':'A'}</div>`;
+    row.innerHTML = `${av}<div class="bwrap"><div class="bubble${dim?' dim':''}">${esc(text)}</div><div class="bt">${ts()}</div></div>`;
+  }
+  box.appendChild(row);
+  box.scrollTop = box.scrollHeight;
+  return row;
+}
+
+let typingEl = null;
+function showTyping() {
+  if (typingEl) return;
+  const box = document.getElementById('msgs');
+  const sp  = document.getElementById('splash');
+  if (sp) sp.remove();
+  typingEl = document.createElement('div');
+  typingEl.className = 'mrow ai';
+  typingEl.innerHTML = `<div class="mav">AI</div><div class="typing-row"><div class="tdots"><span></span><span></span><span></span></div><span style="margin-left:6px">AI is typing...</span></div>`;
+  box.appendChild(typingEl);
+  box.scrollTop = box.scrollHeight;
+  setAvatarMode('thinking');
+}
+function hideTyping() {
+  if (typingEl) { typingEl.remove(); typingEl = null; }
+}
+
+function handleTx(segs, part) {
+  const isAI  = part && part.identity !== room.localParticipant.identity;
+  const role  = isAI ? 'ai' : 'you';
+  if (isAI)  { hideTyping(); setAvatarMode('speaking'); }
+  else       { setAvatarMode('listening'); }
+  for (const seg of segs) {
+    if (!seg.text.trim()) continue;
+    if (seg.final) {
+      if (interim[seg.id]) {
+        interim[seg.id].querySelector('.bubble').classList.remove('dim');
+        interim[seg.id].querySelector('.bubble').textContent = seg.text;
+        delete interim[seg.id];
+      } else {
+        addMsg(role, seg.text);
+      }
+      if (isAI) checkStage(seg.text);
+    } else {
+      if (interim[seg.id]) interim[seg.id].querySelector('.bubble').textContent = seg.text;
+      else interim[seg.id] = addMsg(role, seg.text, true);
+    }
+    document.getElementById('msgs').scrollTop = 99999;
+  }
+}
+
+// ── LiveKit connect ───────────────────────────────────────────────────────────
+document.getElementById('startBtn').onclick  = startInterview;
+document.getElementById('endBtn').onclick    = endInterview;
+
+async function startInterview() {
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('overlay').classList.add('show');
+  setAvatarMode('thinking');
+  try {
+    // Use prefetched token data if available, otherwise fetch now
+    let data = cachedTokenData;
+    if (!data) {
+      const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
+      data = await res.json();
+      if (!res.ok) {
+        alert('Error: ' + (data.detail || 'Failed to get token'));
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('overlay').classList.remove('show');
+        setAvatarMode('idle');
+        return;
+      }
+      cachedTokenData = data;
+    }
+    room = new LivekitClient.Room({ rtcConfig: { iceTransportPolicy: 'relay' } });
+
+    room.on(LivekitClient.RoomEvent.Connected, () => {
+      document.getElementById('overlay').classList.remove('show');
+      document.getElementById('start-wrap').style.display = 'none';
+      document.getElementById('input-wrap').style.display = 'block';
+      document.getElementById('endBtn').disabled = false;
+      setConnLabel('Online');
+      startTimer();
+      addMsg('sys', 'Secure session established. Sarah will begin shortly.');
+      showTyping();
+      setAvatarMode('thinking');
+    });
+
+    room.on(LivekitClient.RoomEvent.Disconnected, () => {
+      stopTimer();
+      setConnLabel('Disconnected');
+      document.getElementById('endBtn').disabled = true;
+      setAvatarMode('idle');
+      allDone();
+      document.getElementById('done-scr').classList.add('show');
+    });
+
+    room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      const isSimliAvatar = participant.identity === 'simli-avatar';
+
+      if (track.kind === LivekitClient.Track.Kind.Video && isSimliAvatar) {
+        // ── Simli avatar video track — show real face, hide plasma orb ───────
+        const videoEl = document.getElementById('avatar-video');
+        track.attach(videoEl);
+        videoEl.style.display = 'block';
+        document.getElementById('plasma-canvas').style.display = 'none';
+        console.log('[avatar] Simli video track live');
+      } else if (track.kind === LivekitClient.Track.Kind.Audio && !isSimliAvatar) {
+        // ── Agent audio — hook into waveform + plasma state ──────────────────
+        const el = track.attach();
+        el.style.display = 'none';
+        document.body.appendChild(el);
+        hookAI(el);
+      }
+      // Simli audio is never published (video-only renderer) — no muting needed
+    });
+
+    room.on(LivekitClient.RoomEvent.TrackUnsubscribed, t => {
+      if (t.kind === LivekitClient.Track.Kind.Audio) t.detach();
+    });
+
+    room.on(LivekitClient.RoomEvent.TranscriptionReceived, (segs, part) => handleTx(segs, part));
+
+    room.on(LivekitClient.RoomEvent.ActiveSpeakersChanged, speakers => {
+      const youSpeak = speakers.some(s => s.identity === room.localParticipant.identity);
+      if (youSpeak) setAvatarMode('listening');
+      else if (plasmaMode === 'listening') setAvatarMode('idle');
+    });
+
+    await room.connect(data.livekit_url, data.token);
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    hookMic(stream);
+    await room.localParticipant.setMicrophoneEnabled(true);
+
+  } catch (err) {
+    console.error(err);
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('overlay').classList.remove('show');
+    setAvatarMode('idle');
+    addMsg('sys', 'Connection failed: ' + err.message);
+  }
+}
+
+async function endInterview() {
+  if (room) { await room.disconnect(); room = null; }
+  stopTimer();
+  setConnLabel('Ended');
+  document.getElementById('endBtn').disabled = true;
+  document.getElementById('startBtn').disabled = true;
+  setAvatarMode('idle');
+}
+</script>
+</body>
+</html>
