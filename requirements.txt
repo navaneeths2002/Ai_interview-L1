@@ -33,3 +33,6 @@ livekit-agents[anthropic,deepgram,elevenlabs,silero]
 
 # Simli - Real-time avatar
 simli-ai
+
+# Scheduler (Phase 8 — workflow durability)
+apscheduler>=3.10.0

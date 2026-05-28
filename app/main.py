@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -6,7 +8,23 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.core.middleware import TenantMiddleware
-from app.api.v1.routes import health, interviews, session, evaluation, reports
+from app.api.v1.routes import health, interviews, session, evaluation, reports, recovery
+from app.services.recovery import run_all_recovery
+from app.workers.scheduler import start_scheduler, stop_scheduler
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ────────────────────────────────────────────────────────────────
+    # Run an immediate recovery pass so any interviews broken during the last
+    # server downtime are fixed before we start accepting new traffic.
+    await run_all_recovery()
+    start_scheduler()
+
+    yield
+
+    # ── Shutdown ───────────────────────────────────────────────────────────────
+    stop_scheduler()
 
 
 app = FastAPI(
@@ -14,6 +32,7 @@ app = FastAPI(
     description="L1 AI HR Screening Microservice",
     version="1.0.0",
     docs_url="/docs" if settings.app_env == "development" else None,
+    lifespan=lifespan,
 )
 
 # CORS
@@ -37,6 +56,7 @@ app.include_router(interviews.router,  prefix="/api/v1", tags=["Interviews"])
 app.include_router(session.router,     prefix="/api/v1", tags=["Session"])
 app.include_router(evaluation.router,  prefix="/api/v1", tags=["Evaluation"])
 app.include_router(reports.router,     prefix="/api/v1", tags=["Reports"])
+app.include_router(recovery.router,    prefix="/api/v1", tags=["Recovery"])
 
 
 # Candidate interview page — served at /interview/{interview_id}

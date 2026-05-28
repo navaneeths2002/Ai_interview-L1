@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.candidate import Candidate, CandidateProfile
+from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.ats_score import AtsScore
 from app.models.interview import Interview, InterviewContext
@@ -28,7 +28,7 @@ async def build_interview_context(
     # Step 1 — Extract resume data from ATS parser response
     resume = extract_resume_data(request.parsed_resume)
 
-    # Step 2 — Save candidate to DB
+    # Step 2 — Save candidate (with embedded profile JSONB) to DB
     candidate = Candidate(
         id=str(uuid.uuid4()),
         tenant_id=tenant_id,
@@ -37,25 +37,22 @@ async def build_interview_context(
         last_name=resume["last_name"] or (request.candidate_name.split()[-1] if len(request.candidate_name.split()) > 1 else ""),
         email=resume["email"] or request.candidate_email,
         phone=resume["phone"] or request.candidate_phone,
+        # All resume-parsed profile data lives in a single JSONB document
+        profile={
+            "total_experience_years": resume["total_experience_years"],
+            "current_company":        resume["current_company"],
+            "current_role":           resume["current_role"],
+            "skills":                 resume["skills"]        or [],
+            "certifications":         resume["certifications"] or [],
+            "languages":              resume["languages"]      or [],
+            "education":              resume["education"],
+            "experience":             resume["experience"],
+            "projects":               resume["projects"],
+            "resume_s3_key":          None,
+            "parsed_s3_key":          None,
+        },
     )
     db.add(candidate)
-
-    # Step 3 — Save candidate profile to DB
-    profile = CandidateProfile(
-        id=str(uuid.uuid4()),
-        tenant_id=tenant_id,
-        candidate_id=candidate.id,
-        total_experience_years=resume["total_experience_years"],
-        current_company=resume["current_company"],
-        current_role=resume["current_role"],
-        skills=resume["skills"],
-        certifications=resume["certifications"],
-        languages=resume["languages"],
-        education=resume["education"],
-        experience=resume["experience"],
-        projects=resume["projects"],
-    )
-    db.add(profile)
 
     # Step 4 — Save job to DB
     job_input = request.job

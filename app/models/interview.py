@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import String, Integer, BigInteger, Boolean, Text, DateTime, Numeric
+from sqlalchemy import String, Integer, Boolean, Text, DateTime
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -78,24 +78,24 @@ class InterviewExtractedData(BaseModel):
 
     interview_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
 
-    current_company: Mapped[str] = mapped_column(String(255), nullable=True)
-    current_role: Mapped[str] = mapped_column(String(255), nullable=True)
-    total_experience_years: Mapped[float] = mapped_column(Numeric(4, 1), nullable=True)
+    # JSONB document — replaces the 12 individual typed columns.
+    # Shape (mirrors the "extracted" key returned by Claude in evaluation_engine.py):
+    # {
+    #   "current_company":        str   | null,
+    #   "current_role":           str   | null,
+    #   "total_experience_years": float | null,
+    #   "current_ctc":            int   | null,   # annual INR
+    #   "expected_ctc":           int   | null,   # annual INR
+    #   "notice_period_days":     int   | null,
+    #   "notice_negotiable":      bool  | null,
+    #   "relocation_willing":     bool  | null,
+    #   "preferred_locations":    [str, ...],
+    #   "work_authorization":     str   | null,
+    #   "earliest_joining":       str   | null,
+    # }
+    extracted: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
-    current_ctc: Mapped[int] = mapped_column(BigInteger, nullable=True)
-    expected_ctc: Mapped[int] = mapped_column(BigInteger, nullable=True)
-
-    notice_period_days: Mapped[int] = mapped_column(Integer, nullable=True)
-    notice_negotiable: Mapped[bool] = mapped_column(Boolean, nullable=True)
-
-    relocation_willing: Mapped[bool] = mapped_column(Boolean, nullable=True)
-    preferred_locations: Mapped[list] = mapped_column(ARRAY(Text), nullable=True)
-
-    shift_flexible: Mapped[bool] = mapped_column(Boolean, nullable=True)
-    work_authorization: Mapped[str] = mapped_column(String(100), nullable=True)
-    earliest_joining: Mapped[str] = mapped_column(String(50), nullable=True)
-
-    # Full raw extraction output from LLM
+    # Full raw Claude output saved for audit / re-processing
     raw_extraction: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
 

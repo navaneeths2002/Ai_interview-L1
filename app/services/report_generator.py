@@ -9,6 +9,7 @@ Outputs:
   • report_html  — self-contained HTML (browser-renderable, print-to-PDF ready)
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -22,7 +23,7 @@ from app.models.interview import (
     Interview, InterviewContext, InterviewTranscript,
     InterviewExtractedData, InterviewScore,
 )
-from app.models.candidate import Candidate, CandidateProfile
+from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.ats_score import AtsScore
 from app.models.report import InterviewReport
@@ -391,7 +392,7 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
     if not interview:
         return None
 
-    # Candidate
+    # Candidate (profile is embedded as JSONB in Candidate.profile)
     candidate = (await db.execute(
         select(Candidate).where(Candidate.id == interview.candidate_id)
     )).scalar_one_or_none()
@@ -399,11 +400,7 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         f"{candidate.first_name} {candidate.last_name or ''}".strip()
         if candidate else "Candidate"
     )
-
-    # Profile
-    profile = (await db.execute(
-        select(CandidateProfile).where(CandidateProfile.candidate_id == interview.candidate_id)
-    )).scalar_one_or_none()
+    profile: dict = (candidate.profile or {}) if candidate else {}
 
     # Job
     job = (await db.execute(
@@ -447,19 +444,9 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
     weaknesses = raw.get("weaknesses", [])
     red_flags  = raw.get("red_flags",  [])
 
-    ext_data = {
-        "current_company":        ext_row.current_company        if ext_row else None,
-        "current_role":           ext_row.current_role           if ext_row else None,
-        "total_experience_years": float(ext_row.total_experience_years) if ext_row and ext_row.total_experience_years else None,
-        "current_ctc":            ext_row.current_ctc            if ext_row else None,
-        "expected_ctc":           ext_row.expected_ctc           if ext_row else None,
-        "notice_period_days":     ext_row.notice_period_days     if ext_row else None,
-        "notice_negotiable":      ext_row.notice_negotiable      if ext_row else None,
-        "relocation_willing":     ext_row.relocation_willing     if ext_row else None,
-        "preferred_locations":    ext_row.preferred_locations    if ext_row else [],
-        "work_authorization":     ext_row.work_authorization     if ext_row else None,
-        "earliest_joining":       ext_row.earliest_joining       if ext_row else None,
-    }
+    # ext_data: read from the 'extracted' JSONB document (new path)
+    # Falls back to empty dict gracefully when the column is null (pre-migration rows).
+    ext_data: dict = (ext_row.extracted or {}) if ext_row else {}
 
     now = datetime.now(timezone.utc)
 
@@ -492,9 +479,10 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         "extracted_data": ext_data,
 
         "candidate_profile": {
-            "skills":           profile.skills           if profile else [],
-            "certifications":   profile.certifications   if profile else [],
-            "experience_years": float(profile.total_experience_years) if profile and profile.total_experience_years else None,
+            "skills":           profile.get("skills")           or [],
+            "certifications":   profile.get("certifications")   or [],
+            "experience_years": float(profile["total_experience_years"])
+                                if profile.get("total_experience_years") else None,
         },
 
         "transcript_highlights": _pick_highlights(list(transcripts), max_pairs=5),
@@ -509,15 +497,36 @@ async def run_report(interview_id: str) -> bool:
     """
     Generate and save a recruiter report for the given interview.
     Safe to call as a fire-and-forget asyncio task.
+    Retries up to 3 times with exponential backoff on exception.
     Returns True on success.
     """
     logger.info(f"[report] generating report for {interview_id}")
-    try:
-        async with AsyncSessionLocal() as db:
-            return await _generate(db, interview_id)
-    except Exception as e:
-        logger.error(f"[report] fatal error for {interview_id}: {e}", exc_info=True)
-        return False
+
+    _max_attempts = 3
+    _backoff_seconds = [2, 4, 8]
+
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await _generate(db, interview_id)
+            return result
+        except Exception as exc:
+            if attempt < _max_attempts:
+                wait = _backoff_seconds[attempt - 1]
+                logger.warning(
+                    f"[report] attempt {attempt}/{_max_attempts} failed for "
+                    f"{interview_id} -- retrying in {wait}s: {exc}"
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    f"[report] fatal error after {_max_attempts} attempts "
+                    f"for {interview_id}: {exc}",
+                    exc_info=True,
+                )
+                return False
+
+    return False  # unreachable but satisfies type checker
 
 
 async def _generate(db: AsyncSession, interview_id: str) -> bool:

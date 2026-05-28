@@ -1,9 +1,17 @@
 import asyncio
+import logging
 import random
 import uuid
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+# Silence chatty WebRTC / ICE / charset debug spam from aiortc P2P transport
+logging.getLogger("aiortc").setLevel(logging.WARNING)
+logging.getLogger("aiortc.rtcdtlstransport").setLevel(logging.WARNING)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("aioice.ice").setLevel(logging.WARNING)
+logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, RoomInputOptions, cli
 from livekit.agents import llm
@@ -37,6 +45,12 @@ Natural behavior (follow these exactly):
 - If an answer is vague or incomplete, ask naturally: "Could you tell me a bit more about that?"
 - Vary your phrasing — never ask the same question the same way twice
 - Occasionally use a brief pause phrase like "Hmm, interesting" before a follow-up
+
+Handling typed text and spelling corrections:
+- The candidate may type their response in a chat box instead of speaking — treat typed messages exactly like spoken ones
+- When the candidate spells out a name or word letter-by-letter (e.g. "Navaneeth — N-A-V-A-N-E-E-T-H" or "TCS — T-C-S"), confirm by saying "Got it — [assembled name], thank you" and use that exact spelling from this point forward
+- When the candidate corrects a previously mentioned name or company (e.g. "Actually it's Infosys, not Infosis"), acknowledge naturally: "My apologies — Infosys, noted." and use the corrected spelling going forward
+- Never ask the candidate to spell something out again once they've already done so
 """
 
 # Short filler lines spoken before the main LLM response (20% of turns)
@@ -131,7 +145,13 @@ async def _load_interview_context(interview_id: str) -> dict:
         return defaults
 
 
-async def _save_transcript(interview_id: str, tenant_id: str, speaker: str, message: str) -> None:
+async def _save_transcript(
+    interview_id: str,
+    tenant_id: str,
+    speaker: str,
+    message: str,
+    spoken_at: datetime,          # ← captured at queue time, not task-run time
+) -> None:
     """Insert a single transcript row — fire-and-forget, never blocks pipeline."""
     if not message.strip():
         return
@@ -154,8 +174,8 @@ async def _save_transcript(interview_id: str, tenant_id: str, speaker: str, mess
                     "interview_id": interview_id,
                     "speaker": speaker,
                     "message": message.strip(),
-                    "spoken_at": now,
-                    "now": now,
+                    "spoken_at": spoken_at,   # exact moment the message was said
+                    "now": now,               # created_at/updated_at = DB write time
                 },
             )
             await session.commit()
@@ -256,8 +276,11 @@ class HRInterviewAgent(Agent):
 
     def _queue_save(self, speaker: str, text: str) -> None:
         if self.interview_id and self.tenant_id and text.strip():
+            # Capture timestamp NOW — before the async task runs — so fire-and-forget
+            # tasks always write the actual spoken time, not the DB-write time.
+            spoken_at = datetime.now(timezone.utc)
             asyncio.create_task(
-                _save_transcript(self.interview_id, self.tenant_id, speaker, text)
+                _save_transcript(self.interview_id, self.tenant_id, speaker, text, spoken_at)
             )
 
     def _log_stage(self) -> None:
@@ -273,6 +296,7 @@ class HRInterviewAgent(Agent):
         new_message: llm.ChatMessage,
     ) -> None:
         text = _extract_text(new_message).strip()
+        print(f"[stt] heard: '{text}'")   # ← diagnostic: confirms audio reached Deepgram
         words = text.split()
 
         # Mishear guard
@@ -313,6 +337,47 @@ class HRInterviewAgent(Agent):
                 if ai_text:
                     self._queue_save("ai", ai_text)
                 break
+
+    # ── Typed text input ──────────────────────────────────────────────────────
+
+    async def handle_typed_input(self, text: str) -> None:
+        """
+        Handle a message the candidate typed in the chat box.
+
+        Runs the same pipeline as a voice turn:
+          save → graph advance → optional filler → generate_reply (LLM + TTS)
+
+        generate_reply adds the user_input to the chat context, calls the LLM,
+        synthesises TTS, and triggers on_user_turn_completed so the AI reply
+        is captured and saved to the transcript automatically.
+        """
+        text = text.strip()
+        if not text:
+            return
+
+        # ── Save candidate message ───────────────────────────────────────────
+        self._queue_save("candidate", text)
+
+        # ── Advance LangGraph state ──────────────────────────────────────────
+        try:
+            new_state = await self._graph.ainvoke(
+                {**self._graph_state, "last_candidate_text": text}
+            )
+            self._graph_state = new_state
+            self._log_stage()
+        except Exception as e:
+            print(f"[graph] advance error (typed): {e}")
+
+        # ── Natural pre-response pause ───────────────────────────────────────
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        # ── 20% filler ──────────────────────────────────────────────────────
+        if random.random() < 0.20:
+            await self.session.say(random.choice(_FILLERS), allow_interruptions=False)
+            await asyncio.sleep(0.15)
+
+        # ── Generate AI response (stage-aware via instructions property) ─────
+        await self.session.generate_reply(user_input=text)
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────────
@@ -361,13 +426,21 @@ async def entrypoint(ctx: JobContext):
         )
 
     session = AgentSession(
-        vad=silero.VAD.load(),
+        vad=silero.VAD.load(
+            min_speech_duration=0.05,       # start detecting after 50 ms of speech
+            min_silence_duration=0.5,       # end turn after 500 ms silence
+            activation_threshold=0.35,      # lower = more sensitive (default 0.5)
+            prefix_padding_duration=0.3,    # include 300 ms before speech onset
+        ),
         stt=deepgram.STT(
             api_key=os.environ["DEEPGRAM_API_KEY"],
             language="en-IN",
-            model="nova-3",
+            model="nova-2-general",         # nova-3 lacks en-IN; nova-2-general is reliable
             endpointing_ms=300,
             interim_results=True,
+            smart_format=True,              # fix punctuation & casing automatically
+            punctuate=True,
+            filler_words=False,             # don't transcribe "um" / "uh" as words
         ),
         llm=anthropic.LLM(
             model="claude-haiku-4-5-20251001",
@@ -416,34 +489,68 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(on_shutdown)
 
+    hr_agent = HRInterviewAgent(
+        graph_state=graph_state,
+        interview_id=interview_id,
+        tenant_id=tenant_id,
+    )
+
     await session.start(
         room=ctx.room,
-        agent=HRInterviewAgent(
-            graph_state=graph_state,
-            interview_id=interview_id,
-            tenant_id=tenant_id,
-        ),
+        agent=hr_agent,
         room_input_options=RoomInputOptions(),
     )
+
+    # ── Text input via data channel ───────────────────────────────────────────
+    # Candidate can type in the chat box; the browser publishes a data packet
+    # with topic="text_input". We forward it through the same agent pipeline as
+    # a voice turn so the AI responds naturally (including spelling corrections).
+    @ctx.room.on("data_received")
+    def on_data_received(data_packet) -> None:
+        try:
+            if getattr(data_packet, "topic", None) == "text_input":
+                text = data_packet.data.decode("utf-8").strip()
+                if text:
+                    print(f"[agent] text input received: {text[:80]}")
+                    asyncio.create_task(hr_agent.handle_typed_input(text))
+        except Exception as e:
+            print(f"[agent] data_received error: {e}")
 
     # ── Avatar (optional — gracefully disabled if Simli keys not set) ────────
     avatar = AvatarSession()
     _avatar_holder.append(avatar)   # expose to on_shutdown closure
 
-    simli_forwarder = await avatar.start(
-        room_name=room_name,
-        lk_url=os.environ.get("LIVEKIT_URL", ""),
-        lk_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
-        lk_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
-        simli_api_key=os.environ.get("SIMLI_API_KEY", ""),
-        simli_face_id=os.environ.get("SIMLI_FACE_ID", ""),
-        current_audio_output=session.output.audio,
-    )
+    simli_api_key = os.environ.get("SIMLI_API_KEY", "")
+    simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
+
+    simli_forwarder = None
+    if simli_api_key and simli_face_id:
+        # Hard 8-second cap so a slow/failed Simli connection never delays the interview
+        try:
+            simli_forwarder = await asyncio.wait_for(
+                avatar.start(
+                    room_name=room_name,
+                    lk_url=os.environ.get("LIVEKIT_URL", ""),
+                    lk_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
+                    lk_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
+                    simli_api_key=simli_api_key,
+                    simli_face_id=simli_face_id,
+                    current_audio_output=session.output.audio,
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            print("[avatar] Simli start timed out (>8s) — voice-only mode")
+            await avatar.stop()
+            simli_forwarder = None
+    else:
+        print("[avatar] SIMLI_API_KEY or SIMLI_FACE_ID not set — voice-only mode")
+
     if simli_forwarder is not None:
         session.output.audio = simli_forwarder
         print("[avatar] Simli avatar active — face video published to room")
     else:
-        print("[avatar] Simli avatar disabled — voice-only mode")
+        print("[avatar] running in voice-only mode")
 
     await session.generate_reply(
         instructions=(

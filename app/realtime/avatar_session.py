@@ -248,7 +248,8 @@ class AvatarSession:
             self._client = SimliClient(
                 api_key=simli_api_key,
                 config=config,
-                transport_mode=TransportMode.LIVEKIT,
+                transport_mode=TransportMode.P2P,
+                retry_count=1,   # fail-fast: P2P only, don't retry with LIVEKIT transport
             )
 
             logger.info("[avatar] starting SimliClient…")

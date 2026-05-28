@@ -10,6 +10,7 @@ Pipeline:
   4. Save to interview_scores + interview_extracted_data tables
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import anthropic
 from dotenv import load_dotenv
 from sqlalchemy import select, and_
 
-load_dotenv()
+load_dotenv(override=True)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import AsyncSessionLocal
@@ -31,7 +32,7 @@ from app.models.interview import (
     InterviewExtractedData,
     InterviewScore,
 )
-from app.models.candidate import Candidate, CandidateProfile
+from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.ats_score import AtsScore
 
@@ -104,27 +105,28 @@ Return ONLY the JSON object.\
 
 def _build_prompt(
     candidate_name: str,
-    profile: CandidateProfile | None,
+    profile: dict | None,          # Candidate.profile JSONB dict
     job: Job | None,
     ats: AtsScore | None,
     context: InterviewContext | None,
     transcripts: list,
 ) -> str:
     lines: list[str] = []
+    p = profile or {}
 
     # ── Candidate profile ──────────────────────────────────────────────────────
     lines.append(f"## CANDIDATE: {candidate_name}")
-    if profile:
-        if profile.total_experience_years is not None:
-            lines.append(f"- Resume experience : {profile.total_experience_years} years")
-        if profile.current_company:
-            lines.append(f"- Current company   : {profile.current_company}")
-        if profile.current_role:
-            lines.append(f"- Current role      : {profile.current_role}")
-        if profile.skills:
-            lines.append(f"- Skills            : {', '.join(profile.skills)}")
-        if profile.certifications:
-            lines.append(f"- Certifications    : {', '.join(profile.certifications)}")
+    if p:
+        if p.get("total_experience_years") is not None:
+            lines.append(f"- Resume experience : {p['total_experience_years']} years")
+        if p.get("current_company"):
+            lines.append(f"- Current company   : {p['current_company']}")
+        if p.get("current_role"):
+            lines.append(f"- Current role      : {p['current_role']}")
+        if p.get("skills"):
+            lines.append(f"- Skills            : {', '.join(p['skills'])}")
+        if p.get("certifications"):
+            lines.append(f"- Certifications    : {', '.join(p['certifications'])}")
 
     # ── Job requirements ───────────────────────────────────────────────────────
     if job:
@@ -257,19 +259,23 @@ async def _save_results(
         ext_row = InterviewExtractedData(interview_id=interview_id, tenant_id=tenant_id)
         db.add(ext_row)
 
-    ext_row.current_company         = ext.get("current_company")
-    ext_row.current_role            = ext.get("current_role")
-    ext_row.total_experience_years  = _safe_float(ext.get("total_experience_years"))
-    ext_row.current_ctc             = _safe_int(ext.get("current_ctc"))
-    ext_row.expected_ctc            = _safe_int(ext.get("expected_ctc"))
-    ext_row.notice_period_days      = _safe_int(ext.get("notice_period_days"))
-    ext_row.notice_negotiable       = ext.get("notice_negotiable")
-    ext_row.relocation_willing      = ext.get("relocation_willing")
-    ext_row.preferred_locations     = ext.get("preferred_locations") or []
-    ext_row.work_authorization      = ext.get("work_authorization")
-    ext_row.earliest_joining        = ext.get("earliest_joining")
-    # Keep full output for audit
-    ext_row.raw_extraction          = result
+    # Store the entire "extracted" block as a JSONB document — one write, all fields.
+    # Coerce numeric types so the JSON is clean for downstream readers.
+    ext_row.extracted = {
+        "current_company":        ext.get("current_company"),
+        "current_role":           ext.get("current_role"),
+        "total_experience_years": _safe_float(ext.get("total_experience_years")),
+        "current_ctc":            _safe_int(ext.get("current_ctc")),
+        "expected_ctc":           _safe_int(ext.get("expected_ctc")),
+        "notice_period_days":     _safe_int(ext.get("notice_period_days")),
+        "notice_negotiable":      ext.get("notice_negotiable"),
+        "relocation_willing":     ext.get("relocation_willing"),
+        "preferred_locations":    ext.get("preferred_locations") or [],
+        "work_authorization":     ext.get("work_authorization"),
+        "earliest_joining":       ext.get("earliest_joining"),
+    }
+    # Keep the full raw Claude output for audit / re-processing
+    ext_row.raw_extraction = result
 
     await db.commit()
 
@@ -303,7 +309,7 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         logger.error(f"[eval] interview {interview_id} not found")
         return False
 
-    # ── 2. Load candidate + profile ────────────────────────────────────────────
+    # ── 2. Load candidate (profile is embedded as JSONB) ──────────────────────
     candidate = (await db.execute(
         select(Candidate).where(Candidate.id == interview.candidate_id)
     )).scalar_one_or_none()
@@ -313,9 +319,8 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         if candidate else "Candidate"
     )
 
-    profile = (await db.execute(
-        select(CandidateProfile).where(CandidateProfile.candidate_id == interview.candidate_id)
-    )).scalar_one_or_none()
+    # profile is now a plain dict from the JSONB column on Candidate
+    profile: dict | None = candidate.profile if candidate else None
 
     # ── 3. Load job ────────────────────────────────────────────────────────────
     job = (await db.execute(
@@ -358,16 +363,38 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         transcripts=list(transcripts),
     )
 
-    # ── 8. Call Claude Sonnet ──────────────────────────────────────────────────
+    # ── 8. Call Claude (with retry on transient errors) ────────────────────────
     client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = await client.messages.create(
-        model=EVAL_MODEL,
-        max_tokens=2048,
-        system=EVALUATION_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
 
-    raw = response.content[0].text
+    _retryable = (anthropic.APIStatusError, anthropic.APIConnectionError)
+    _max_attempts = 3
+    _backoff_seconds = [2, 4, 8]
+    raw: str = ""
+
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            response = await client.messages.create(
+                model=EVAL_MODEL,
+                max_tokens=2048,
+                system=EVALUATION_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text
+            break  # success
+        except _retryable as exc:
+            if attempt < _max_attempts:
+                wait = _backoff_seconds[attempt - 1]
+                logger.warning(
+                    f"[eval] Claude API error on attempt {attempt}/{_max_attempts} "
+                    f"for {interview_id} -- retrying in {wait}s: {exc}"
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    f"[eval] Claude API failed after {_max_attempts} attempts "
+                    f"for {interview_id}: {exc}"
+                )
+                raise
 
     # ── 9. Parse JSON ──────────────────────────────────────────────────────────
     try:

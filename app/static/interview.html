@@ -111,22 +111,80 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
 /* Chat body */
 .chat-body{flex:1;display:flex;gap:14px;padding:16px;overflow:hidden;min-height:0;}
 
-/* Avatar column */
-.av-col{width:198px;flex-shrink:0;display:flex;flex-direction:column;gap:11px;}
-.av-wrap{position:relative;width:192px;height:192px;flex-shrink:0;}
-/* Outer energy glow — state-driven, no spinning ring */
-.av-glow{position:absolute;inset:-10px;border-radius:50%;transition:box-shadow .5s ease;z-index:0;pointer-events:none;}
-.av-glow.idle   {box-shadow:0 0 0 1.5px rgba(59,130,246,.3),0 0 22px rgba(37,99,235,.22),0 0 55px rgba(37,99,235,.07);}
-.av-glow.speaking{animation:glow-beat .48s ease-in-out infinite alternate;}
-.av-glow.listening{box-shadow:0 0 0 2px rgba(234,179,8,.75),0 0 28px rgba(234,179,8,.7),0 0 65px rgba(234,179,8,.28);}
-.av-glow.thinking {box-shadow:0 0 0 1.5px rgba(234,179,8,.5),0 0 24px rgba(234,179,8,.45),0 0 60px rgba(234,179,8,.16);}
-@keyframes glow-beat{
-  from{box-shadow:0 0 0 2px rgba(96,165,250,.65),0 0 24px rgba(59,130,246,.75),0 0 60px rgba(59,130,246,.32),0 0 100px rgba(59,130,246,.12);}
-  to  {box-shadow:0 0 0 3px rgba(147,197,253,.92),0 0 42px rgba(59,130,246,1),0 0 100px rgba(59,130,246,.52),0 0 160px rgba(59,130,246,.22);}
+/* ── Avatar column ─────────────────────────────────────────────────────────── */
+.av-col{width:316px;flex-shrink:0;display:flex;flex-direction:column;gap:10px;}
+
+/* Avatar panel — rounded rectangle, video-call style */
+.av-wrap{
+  position:relative;width:100%;height:370px;
+  border-radius:20px;overflow:hidden;
+  background:#070f1f;
+  border:2px solid rgba(59,130,246,.25);
+  box-shadow:0 8px 32px rgba(37,99,235,.15);
+  transition:border-color .4s ease,box-shadow .4s ease;
+  flex-shrink:0;
 }
-#plasma-canvas{position:absolute;inset:0;border-radius:50%;z-index:1;pointer-events:none;}
-.av-intro{background:var(--abub);border:1px solid var(--abdr);border-radius:11px;padding:11px 12px;font-size:12px;color:var(--txt2);line-height:1.65;box-shadow:var(--shsm);}
-.av-intro-ts{font-size:10px;color:var(--mutl);margin-top:5px;text-align:right;}
+/* State-driven border glow — replaces the outer circle ring */
+.av-wrap.idle     {border-color:rgba(59,130,246,.25);box-shadow:0 8px 32px rgba(37,99,235,.15);}
+.av-wrap.speaking {border-color:rgba(96,165,250,.85);box-shadow:0 0 0 3px rgba(59,130,246,.20),0 8px 44px rgba(37,99,235,.40);animation:rect-glow .5s ease-in-out infinite alternate;}
+.av-wrap.listening{border-color:rgba(234,179,8,.90);box-shadow:0 0 0 3px rgba(234,179,8,.20),0 8px 44px rgba(234,179,8,.35);}
+.av-wrap.thinking {border-color:rgba(245,158,11,.45);box-shadow:0 0 0 2px rgba(245,158,11,.12),0 8px 32px rgba(245,158,11,.20);}
+@keyframes rect-glow{
+  from{box-shadow:0 0 0 2px rgba(96,165,250,.45),0 0 24px rgba(59,130,246,.55),0 8px 44px rgba(37,99,235,.35);}
+  to  {box-shadow:0 0 0 5px rgba(147,197,253,.75),0 0 48px rgba(59,130,246,.90),0 8px 64px rgba(37,99,235,.55);}
+}
+
+/* Old glow ring — kept in DOM for JS compat, hidden visually */
+.av-glow{display:none!important;}
+
+/* Plasma canvas fills the panel; wrap's overflow:hidden clips to rounded rect */
+#plasma-canvas{position:absolute;inset:0;z-index:1;pointer-events:none;}
+
+/* ── Status badge — top-left chip ────────────────────────────────────────── */
+.av-status-badge{
+  position:absolute;top:12px;left:12px;z-index:10;
+  display:flex;align-items:center;gap:6px;
+  background:rgba(0,0,0,.55);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  border:1px solid rgba(255,255,255,.12);border-radius:20px;
+  padding:5px 11px;font-size:10.5px;font-weight:700;color:#fff;
+  letter-spacing:.5px;user-select:none;pointer-events:none;
+  transition:background .3s;
+}
+.av-status-dot{
+  width:7px;height:7px;border-radius:50%;flex-shrink:0;
+  background:#22c55e;box-shadow:0 0 6px rgba(34,197,94,.85);
+  transition:background .3s,box-shadow .3s;
+}
+.av-status-badge.speaking .av-status-dot{background:#60a5fa;box-shadow:0 0 7px rgba(96,165,250,.95);animation:dot-beat .5s ease-in-out infinite alternate;}
+.av-status-badge.listening .av-status-dot{background:#eab308;box-shadow:0 0 7px rgba(234,179,8,.95);}
+.av-status-badge.thinking  .av-status-dot{background:#f59e0b;box-shadow:0 0 5px rgba(245,158,11,.75);animation:dot-beat .9s ease-in-out infinite alternate;}
+@keyframes dot-beat{from{opacity:.5;}to{opacity:1;}}
+
+/* ── Nameplate — frosted glass strip pinned to bottom ───────────────────── */
+.av-nameplate{
+  position:absolute;bottom:0;left:0;right:0;z-index:10;
+  background:rgba(0,0,0,.58);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-top:1px solid rgba(255,255,255,.09);
+  padding:11px 15px;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.av-nameplate-left{display:flex;flex-direction:column;gap:2px;}
+.av-nameplate-name{font-size:14.5px;font-weight:700;color:#fff;letter-spacing:.15px;}
+.av-nameplate-title{font-size:10.5px;color:rgba(255,255,255,.50);font-weight:400;letter-spacing:.2px;}
+.av-nameplate-mic{
+  width:32px;height:32px;border-radius:50%;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);
+  display:flex;align-items:center;justify-content:center;
+  transition:background .25s,border-color .25s;flex-shrink:0;
+}
+.av-nameplate-mic svg{width:14px;height:14px;stroke:rgba(255,255,255,.38);transition:stroke .25s;}
+.av-nameplate-mic.active{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.55);}
+.av-nameplate-mic.active svg{stroke:#93c5fd;}
+
+/* av-intro replaced by in-panel nameplate */
+.av-intro{display:none;}
+.av-intro-ts{display:none;}
+
 .ai-listen-box{display:none;align-items:center;gap:8px;background:var(--abub);border:1px solid var(--abdr);border-radius:11px;padding:9px 12px;font-size:11.5px;color:var(--mut);}
 .ai-listen-box.show{display:flex;}
 .wbars{display:flex;align-items:center;gap:2px;height:18px;}
@@ -357,19 +415,45 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
     <!-- Chat body: avatar col + messages -->
     <div class="chat-body">
 
-      <!-- Avatar column -->
+      <!-- Avatar column — video-call panel -->
       <div class="av-col">
-        <div class="av-wrap" id="av-wrap">
+        <div class="av-wrap idle" id="av-wrap">
+
+          <!-- Hidden legacy glow div (JS references it) -->
           <div id="av-glow" class="av-glow idle"></div>
+
+          <!-- Status badge — top-left -->
+          <div class="av-status-badge" id="av-status-badge">
+            <span class="av-status-dot" id="av-status-dot"></span>
+            <span id="av-status-text">LIVE</span>
+          </div>
+
+          <!-- Plasma orb / fallback animation -->
           <canvas id="plasma-canvas"></canvas>
-          <!-- Simli live avatar video — shown when avatar track arrives, hides canvas -->
+
+          <!-- Simli live avatar video — shown when track arrives, hides plasma canvas -->
           <video id="avatar-video" autoplay playsinline muted
-                 style="position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:cover;z-index:2;display:none;background:#000;"></video>
-        </div>
-        <div class="av-intro">
-          Hello! I'm your AI HR interviewer. I'll be asking you a series of questions to understand your skills and experience.
-          <div class="av-intro-ts" id="av-ts">--:--</div>
-        </div>
+                 style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:2;display:none;background:#000;"></video>
+
+          <!-- Frosted-glass nameplate pinned to bottom -->
+          <div class="av-nameplate">
+            <div class="av-nameplate-left">
+              <span class="av-nameplate-name">Sarah</span>
+              <span class="av-nameplate-title">AI HR Interviewer</span>
+            </div>
+            <div class="av-nameplate-mic" id="av-mic-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="2" width="6" height="12" rx="3"/>
+                <path d="M5 10a7 7 0 0014 0"/>
+                <line x1="12" y1="19" x2="12" y2="22"/>
+                <line x1="8" y1="22" x2="16" y2="22"/>
+              </svg>
+            </div>
+          </div>
+
+        </div><!-- /av-wrap -->
+
+        <!-- Listening indicator below panel when candidate speaks -->
         <div class="ai-listen-box" id="ai-listen">
           <div class="wbars">
             <div class="wb" id="wb1"></div><div class="wb" id="wb2"></div>
@@ -410,7 +494,7 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
             <svg viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2L15 22 11 13 2 9l20-7z"/></svg>
           </button>
         </div>
-        <div class="foot-hint">Press Enter to send</div>
+        <div class="foot-hint">Press Enter to send &nbsp;·&nbsp; Speak naturally <em>or</em> type &nbsp;·&nbsp; Spell names letter-by-letter for clarity (e.g. R-A-J-I-V)</div>
       </div>
     </div>
   </div><!-- /chat-card -->
@@ -597,8 +681,9 @@ function updateClock() {
     `${n.getDate()} ${MONTHS[n.getMonth()]} ${n.getFullYear()}, ${DAYS[n.getDay()].slice(0,3)}`;
   const g = h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening';
   document.getElementById('greeting').textContent = `Good ${g}!`;
-  document.getElementById('av-ts').textContent =
-    `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm}`;
+  // av-ts was removed in the avatar redesign — guard against null
+  const avTs = document.getElementById('av-ts');
+  if (avTs) avTs.textContent = `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm}`;
 }
 updateClock();
 setInterval(updateClock, 1000);
@@ -687,8 +772,9 @@ let plasmaMode  = 'idle';
 let plasmaT     = 0;
 
 function resizePlasma() {
-  const sz = document.getElementById('av-wrap').offsetWidth || 192;
-  plasmaEl.width = sz; plasmaEl.height = sz;
+  const wrap = document.getElementById('av-wrap');
+  plasmaEl.width  = wrap ? wrap.offsetWidth  : 316;
+  plasmaEl.height = wrap ? wrap.offsetHeight : 370;
 }
 resizePlasma();
 window.addEventListener('resize', resizePlasma);
@@ -716,26 +802,30 @@ const STATE_CFG = {
 function drawPlasma() {
   plasmaT += 0.018;
   const w = plasmaEl.width, h = plasmaEl.height;
-  const cx = w/2, cy = h/2, R = w/2;
+  const cx = w/2, cy = h/2;
+  // R = half the shorter axis — keeps the orb a circle centred in the rect
+  const R = Math.min(w, h) / 2;
   plasmaCtx.clearRect(0, 0, w, h);
   const cfg = STATE_CFG[plasmaMode] || STATE_CFG.idle;
 
   // ── 1. Deep-space background ──────────────────────────────────────────────
-  const bg = plasmaCtx.createRadialGradient(cx, cy*0.7, 0, cx, cy, R);
+  // Full-rect background — overflow:hidden on the wrap clips to rounded corners
+  const bgFar = Math.sqrt(w*w + h*h) / 2;
+  const bg = plasmaCtx.createRadialGradient(cx, cy*0.65, 0, cx, cy, bgFar);
   bg.addColorStop(0,   cfg.bgA);
   bg.addColorStop(0.5, cfg.bgB);
   bg.addColorStop(1,   cfg.bgC);
-  plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, R, 0, Math.PI*2);
-  plasmaCtx.fillStyle = bg; plasmaCtx.fill();
+  plasmaCtx.fillStyle = bg;
+  plasmaCtx.fillRect(0, 0, w, h);
 
-  // ── 2. Ambient inner glow ─────────────────────────────────────────────────
+  // ── 2. Ambient inner glow (centred orb, fills rect) ───────────────────────
   const glowAlpha = plasmaMode === 'idle' ? 0.14 : 0.28;
   const gInner = plasmaCtx.createRadialGradient(cx, cy, R*0.30, cx, cy, R*0.92);
-  gInner.addColorStop(0,   `hsla(${cfg.hue},100%,68%,0)`);
+  gInner.addColorStop(0,    `hsla(${cfg.hue},100%,68%,0)`);
   gInner.addColorStop(0.65, `hsla(${cfg.hue},100%,62%,${glowAlpha})`);
   gInner.addColorStop(1,    `hsla(${cfg.hue},100%,55%,${glowAlpha*0.45})`);
-  plasmaCtx.beginPath(); plasmaCtx.arc(cx, cy, R, 0, Math.PI*2);
-  plasmaCtx.fillStyle = gInner; plasmaCtx.fill();
+  plasmaCtx.fillStyle = gInner;
+  plasmaCtx.fillRect(0, 0, w, h);
 
   // ── 3. Speaking: animated energy bands ───────────────────────────────────
   if (plasmaMode === 'speaking') {
@@ -927,32 +1017,49 @@ function hookMic(stream) {
 // ── Avatar mode ───────────────────────────────────────────────────────────────
 function setAvatarMode(mode) {
   plasmaMode = mode;
-  const glow    = document.getElementById('av-glow');
-  const wvBar   = document.getElementById('wv-bar');
-  const wvDot   = document.getElementById('wv-dot');
-  const wvLbl   = document.getElementById('wv-lbl');
+  const wrap      = document.getElementById('av-wrap');
+  const badge     = document.getElementById('av-status-badge');
+  const statusTxt = document.getElementById('av-status-text');
+  const micIcon   = document.getElementById('av-mic-icon');
+  const wvBar     = document.getElementById('wv-bar');
+  const wvDot     = document.getElementById('wv-dot');
+  const wvLbl     = document.getElementById('wv-lbl');
   const listenBox = document.getElementById('ai-listen');
 
-  // Update glow ring class — drives CSS box-shadow animation
-  if (glow) glow.className = 'av-glow ' + (mode || 'idle');
+  // Drive border-glow state via class on the panel itself
+  if (wrap)  wrap.className  = 'av-wrap ' + (mode || 'idle');
+  // Badge state class (drives dot colour + animation)
+  if (badge) badge.className = 'av-status-badge ' + (mode || '');
 
   if (mode === 'speaking') {
+    if (statusTxt) statusTxt.textContent = 'SPEAKING';
+    if (micIcon)   micIcon.classList.add('active');
     wvMode = 'speaking';
     wvBar.classList.add('show');
     if (wvDot) wvDot.style.background = 'var(--pri)';
     if (wvLbl) wvLbl.textContent = 'Sarah is speaking';
     listenBox.classList.remove('show');
+
   } else if (mode === 'listening') {
+    if (statusTxt) statusTxt.textContent = 'LISTENING';
+    if (micIcon)   micIcon.classList.remove('active');
     wvMode = 'listening';
     wvBar.classList.add('show');
     if (wvDot) wvDot.style.background = 'var(--ok)';
     if (wvLbl) wvLbl.textContent = 'Listening to you';
     listenBox.classList.add('show');
+
   } else if (mode === 'thinking') {
+    if (statusTxt) statusTxt.textContent = 'THINKING';
+    if (micIcon)   micIcon.classList.remove('active');
     wvMode = 'hidden';
     wvBar.classList.remove('show');
     listenBox.classList.remove('show');
+
   } else {
+    // idle / default
+    if (statusTxt) statusTxt.textContent = 'LIVE';
+    if (micIcon)   micIcon.classList.remove('active');
     wvMode = 'hidden';
     wvBar.classList.remove('show');
     listenBox.classList.remove('show');
@@ -1028,6 +1135,44 @@ function handleTx(segs, part) {
   }
 }
 
+// ── Text input send ───────────────────────────────────────────────────────────
+async function sendTypedMessage() {
+  if (!room) return;
+  const input = document.getElementById('cinput');
+  const text  = input.value.trim();
+  if (!text) return;
+
+  // Show in chat immediately
+  addMsg('you', text);
+  input.value = '';
+  input.focus();
+
+  // Signal thinking state
+  showTyping();
+  setAvatarMode('thinking');
+
+  // Publish to agent via data channel — topic identifies it as typed text
+  try {
+    await room.localParticipant.publishData(
+      new TextEncoder().encode(text),
+      { reliable: true, topic: 'text_input' }
+    );
+  } catch (e) {
+    console.error('[chat] publishData failed:', e);
+    addMsg('sys', 'Could not send message — please try again.');
+  }
+}
+
+// Enter key sends, Shift+Enter would be a newline (not applicable here)
+document.getElementById('cinput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendTypedMessage();
+  }
+});
+
+document.querySelector('.btn-send').addEventListener('click', sendTypedMessage);
+
 // ── LiveKit connect ───────────────────────────────────────────────────────────
 document.getElementById('startBtn').onclick  = startInterview;
 document.getElementById('endBtn').onclick    = endInterview;
@@ -1058,6 +1203,10 @@ async function startInterview() {
       document.getElementById('start-wrap').style.display = 'none';
       document.getElementById('input-wrap').style.display = 'block';
       document.getElementById('endBtn').disabled = false;
+      // Enable text input now that the session is live
+      document.getElementById('cinput').disabled = false;
+      document.getElementById('cinput').placeholder = 'Type your response or spell a name here…';
+      document.querySelector('.btn-send').disabled = false;
       setConnLabel('Online');
       startTimer();
       addMsg('sys', 'Secure session established. Sarah will begin shortly.');
@@ -1106,11 +1255,26 @@ async function startInterview() {
       else if (plasmaMode === 'listening') setAvatarMode('idle');
     });
 
+    // Hook waveform visualizer to the SAME track that LiveKit publishes to the agent.
+    // This fires after setMicrophoneEnabled() succeeds and the track is confirmed live.
+    room.on(LivekitClient.RoomEvent.LocalTrackPublished, (pub) => {
+      if (pub.kind === LivekitClient.Track.Kind.Audio && pub.track?.mediaStreamTrack) {
+        hookMic(new MediaStream([pub.track.mediaStreamTrack]));
+        console.log('[mic] waveform hooked to published microphone track ✓');
+      }
+    });
+
     await room.connect(data.livekit_url, data.token);
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    hookMic(stream);
-    await room.localParticipant.setMicrophoneEnabled(true);
+    // Enable microphone — LiveKit handles getUserMedia internally (one call, one track,
+    // no risk of double-capture conflicts). Error shown in chat if permission denied.
+    try {
+      await room.localParticipant.setMicrophoneEnabled(true);
+      console.log('[mic] microphone published to room ✓');
+    } catch (micErr) {
+      console.error('[mic]', micErr);
+      addMsg('sys', '⚠ Microphone access was denied. Please allow microphone permission in your browser and refresh the page.');
+    }
 
   } catch (err) {
     console.error(err);
