@@ -1,0 +1,36 @@
+[Unit]
+Description=Interview Agent — LiveKit Agent Worker
+Documentation=https://github.com/interbiz/interview-agent
+After=network.target interview-api.service
+Wants=interview-api.service
+
+[Service]
+Type=simple
+User=interview
+Group=interview
+WorkingDirectory=/opt/interview-agent
+
+# Load production environment variables (same file as API)
+EnvironmentFile=/opt/interview-agent/.env
+
+# Start the LiveKit agent worker (no 'dev' flag — production mode)
+ExecStart=/opt/interview-agent/venv/bin/python -m app.realtime.agent start
+
+# Restart on failure — agent crash should never leave interviews hanging
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=120s
+StartLimitBurst=5
+
+# Give the worker time to shut down active calls gracefully
+TimeoutStopSec=60
+
+# Resource limits
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

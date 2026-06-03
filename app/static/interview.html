@@ -597,12 +597,43 @@ themeBtn.onclick = () => {
   themeIcon.innerHTML = darkMode ? MOON_SVG : SUN_SVG;
 };
 
+// ── Show terminal screen (interview completed / expired / failed) ─────────────
+function showInterviewOver(status, candidateName) {
+  const titleEl = document.querySelector('#done-scr .done-title');
+  const subEl   = document.querySelector('#done-scr .done-sub');
+  if (status === 'expired' || status === 'failed') {
+    if (titleEl) titleEl.textContent = 'Interview Link Expired';
+    if (subEl)   subEl.textContent   = 'This interview link is no longer valid. Please contact HR for a new session.';
+  } else {
+    // completed
+    if (titleEl) titleEl.textContent = 'Interview Already Completed';
+    if (subEl)   subEl.textContent   = 'This interview has already been completed. Our team will review your profile and reach out to you shortly.';
+  }
+  // Update header name if we have it
+  if (candidateName) {
+    const name     = candidateName;
+    const initials = name.trim().split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase();
+    document.getElementById('h-uname').textContent = name;
+    document.getElementById('h-av').textContent    = initials || '?';
+  }
+  // Hide start button, show the done overlay
+  document.getElementById('start-wrap').style.display = 'none';
+  document.getElementById('done-scr').classList.add('show');
+}
+
 // ── Prefetch interview info → candidate name ──────────────────────────────────
 (async function prefetchInterviewInfo() {
   try {
     const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
     if (!res.ok) return;
     cachedTokenData = await res.json();
+
+    // If interview is already over, show a clean screen immediately
+    if (!cachedTokenData.token) {
+      showInterviewOver(cachedTokenData.status, cachedTokenData.candidate_name);
+      return;
+    }
+
     const name     = cachedTokenData.candidate_name || 'Candidate';
     const initials = name.trim().split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase();
     document.getElementById('h-uname').textContent = name;
@@ -1188,13 +1219,22 @@ async function startInterview() {
       const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
       data = await res.json();
       if (!res.ok) {
-        alert('Error: ' + (data.detail || 'Failed to get token'));
         document.getElementById('startBtn').disabled = false;
         document.getElementById('overlay').classList.remove('show');
         setAvatarMode('idle');
+        addMsg('sys', 'Unable to connect: ' + (data.detail || 'Unknown error'));
         return;
       }
       cachedTokenData = data;
+    }
+
+    // If the interview is already over (token is null), show the terminal screen
+    if (!data.token) {
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('overlay').classList.remove('show');
+      setAvatarMode('idle');
+      showInterviewOver(data.status, data.candidate_name);
+      return;
     }
     room = new LivekitClient.Room({ rtcConfig: { iceTransportPolicy: 'relay' } });
 

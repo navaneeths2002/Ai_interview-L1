@@ -7,18 +7,19 @@ POST /api/v1/admin/recovery/run     -- manually trigger full recovery pass
 Both endpoints require X-Tenant-ID header (enforced by TenantMiddleware).
 """
 
-import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Request
 from sqlalchemy import select, func, and_, not_, exists
 
+from app.core.logging_config import get_logger
+from app.core.rate_limiter import limiter, LIMIT_RECOVERY
 from app.db.session import AsyncSessionLocal
 from app.models.interview import Interview, InterviewScore, InterviewTranscript
 from app.models.report import InterviewReport
 from app.services.recovery import run_all_recovery
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter()
 
@@ -87,7 +88,7 @@ async def recovery_status(
             )
         )).scalar_one()
 
-        # 4. Scheduled > 24 h with no transcript (abandoned)
+        # 4. Scheduled > 24 h with no transcript turns (abandoned)
         abandoned_count = (await db.execute(
             select(func.count()).select_from(Interview).where(
                 and_(
@@ -96,7 +97,10 @@ async def recovery_status(
                     not_(
                         exists(
                             select(InterviewTranscript.interview_id).where(
-                                InterviewTranscript.interview_id == Interview.id
+                                and_(
+                                    InterviewTranscript.interview_id == Interview.id,
+                                    InterviewTranscript.turn_count > 0,
+                                )
                             )
                         )
                     ),
@@ -122,7 +126,9 @@ async def recovery_status(
 # ---------------------------------------------------------------------------
 
 @router.post("/admin/recovery/run")
+@limiter.limit(LIMIT_RECOVERY)
 async def trigger_recovery(
+    request: Request,
     x_tenant_id: str = Header(..., alias="X-Tenant-ID"),
 ):
     """

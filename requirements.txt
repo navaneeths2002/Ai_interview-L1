@@ -36,3 +36,7 @@ simli-ai
 
 # Scheduler (Phase 8 — workflow durability)
 apscheduler>=3.10.0
+
+# Phase 9 — Hardening
+slowapi>=0.1.9           # Rate limiting (FastAPI-native, wraps limits library)
+python-json-logger>=2.0.7  # Structured JSON logging

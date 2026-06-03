@@ -1,0 +1,39 @@
+[Unit]
+Description=Interview Agent — FastAPI Server
+Documentation=https://github.com/interbiz/interview-agent
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=interview
+Group=interview
+WorkingDirectory=/opt/interview-agent
+
+# Load production environment variables
+EnvironmentFile=/opt/interview-agent/.env
+
+# Activate virtualenv and start uvicorn
+ExecStart=/opt/interview-agent/venv/bin/python -m uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 2 \
+    --log-level warning
+
+# Restart policy — restart 3 s after any non-zero exit
+Restart=on-failure
+RestartSec=3s
+StartLimitInterval=60s
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

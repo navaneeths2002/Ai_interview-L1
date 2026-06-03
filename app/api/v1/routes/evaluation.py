@@ -6,10 +6,11 @@ POST /api/v1/interviews/{id}/evaluate     → manually trigger evaluation (admin
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.rate_limiter import limiter, LIMIT_EVALUATE
 from app.db.session import get_db
 from app.models.interview import Interview, InterviewScore, InterviewExtractedData
 from app.services.evaluation_engine import run_evaluation
@@ -110,7 +111,9 @@ async def get_evaluation(
 # ── POST /api/v1/interviews/{id}/evaluate ─────────────────────────────────────
 
 @router.post("/interviews/{interview_id}/evaluate", status_code=202)
+@limiter.limit(LIMIT_EVALUATE)
 async def trigger_evaluation(
+    request: Request,
     interview_id: str,
     db: AsyncSession = Depends(get_db),
     x_tenant_id: str = Header(..., alias="X-Tenant-ID"),

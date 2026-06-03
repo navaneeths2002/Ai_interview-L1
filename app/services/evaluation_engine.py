@@ -162,11 +162,14 @@ def _build_prompt(
             lines.append(f"- Gaps probed       : {', '.join(context.gaps_to_probe)}")
 
     # ── Full transcript ────────────────────────────────────────────────────────
+    # transcripts is now a list of dicts: {"speaker", "message", "spoken_at", "node"}
     lines.append(f"\n## INTERVIEW TRANSCRIPT  ({len(transcripts)} messages)\n")
     for t in transcripts:
-        speaker = "AI" if t.speaker == "ai" else candidate_name
-        ts = t.spoken_at.strftime("%H:%M:%S") if t.spoken_at else "--:--:--"
-        lines.append(f"[{ts}] {speaker}: {t.message}")
+        speaker = "AI" if t.get("speaker") == "ai" else candidate_name
+        spoken_at_str = t.get("spoken_at", "")
+        # ISO format: "2026-05-28T10:00:01.123456+00:00" → extract HH:MM:SS
+        ts = spoken_at_str[11:19] if len(spoken_at_str) >= 19 else "--:--:--"
+        lines.append(f"[{ts}] {speaker}: {t.get('message', '')}")
 
     return "\n".join(lines)
 
@@ -340,18 +343,19 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         select(InterviewContext).where(InterviewContext.interview_id == interview_id)
     )).scalar_one_or_none()
 
-    # ── 6. Load transcript ─────────────────────────────────────────────────────
-    transcripts = (await db.execute(
+    # ── 6. Load transcript (single row per interview, ordered JSONB array) ────
+    transcript_row = (await db.execute(
         select(InterviewTranscript)
         .where(InterviewTranscript.interview_id == interview_id)
-        .order_by(InterviewTranscript.spoken_at)
-    )).scalars().all()
+    )).scalar_one_or_none()
 
-    if not transcripts:
+    turns = transcript_row.turns if transcript_row else []
+
+    if not turns:
         logger.warning(f"[eval] no transcript found for {interview_id} — skipping")
         return False
 
-    logger.info(f"[eval] loaded {len(transcripts)} transcript messages")
+    logger.info(f"[eval] loaded {len(turns)} transcript turns")
 
     # ── 7. Build prompt ────────────────────────────────────────────────────────
     user_prompt = _build_prompt(
@@ -360,7 +364,7 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         job=job,
         ats=ats,
         context=context,
-        transcripts=list(transcripts),
+        transcripts=turns,          # list of dicts {"speaker","message","spoken_at","node"}
     )
 
     # ── 8. Call Claude (with retry on transient errors) ────────────────────────

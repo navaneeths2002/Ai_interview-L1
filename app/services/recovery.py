@@ -17,7 +17,7 @@ run_all_recovery() sequences them and returns a summary dict.
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, func, text, update, and_, not_, exists
+from sqlalchemy import select, func, text, update, and_, or_, not_, exists, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import AsyncSessionLocal
@@ -28,7 +28,7 @@ from app.models.interview import (
 )
 from app.models.report import InterviewReport
 from app.services.evaluation_engine import run_evaluation
-from app.services.report_generator import run_report
+# run_report is NOT imported here — run_evaluation chains it internally.
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +70,30 @@ async def recover_stuck_interviews() -> int:
             ids_to_process = []
 
             for interview in rows:
-                # Estimate duration from transcript timestamps if available
-                first_ts = (await db.execute(
-                    select(func.min(InterviewTranscript.spoken_at)).where(
+                # Estimate duration from transcript timestamps if available.
+                # New design: one row per interview, turns is an ordered JSONB array.
+                transcript_row = (await db.execute(
+                    select(InterviewTranscript).where(
                         InterviewTranscript.interview_id == str(interview.id)
                     )
                 )).scalar_one_or_none()
 
-                last_ts = (await db.execute(
-                    select(func.max(InterviewTranscript.spoken_at)).where(
-                        InterviewTranscript.interview_id == str(interview.id)
-                    )
-                )).scalar_one_or_none()
+                first_ts = None
+                last_ts  = None
+                if transcript_row and transcript_row.turns:
+                    try:
+                        first_str = transcript_row.turns[0].get("spoken_at")
+                        last_str  = transcript_row.turns[-1].get("spoken_at")
+                        if first_str:
+                            first_ts = datetime.fromisoformat(
+                                first_str.replace("Z", "+00:00")
+                            )
+                        if last_str:
+                            last_ts = datetime.fromisoformat(
+                                last_str.replace("Z", "+00:00")
+                            )
+                    except Exception:
+                        pass
 
                 duration = None
                 if first_ts and last_ts and last_ts > first_ts:
@@ -101,7 +113,9 @@ async def recover_stuck_interviews() -> int:
 
             await db.commit()
 
-        # Run evaluation + report outside the commit session
+        # Run evaluation outside the commit session.
+        # run_evaluation already chains run_report internally — do NOT call
+        # run_report separately here or the report will be generated twice (BUG 15).
         for interview_id in ids_to_process:
             try:
                 logger.info(
@@ -111,16 +125,6 @@ async def recover_stuck_interviews() -> int:
             except Exception as exc:
                 logger.error(
                     f"[recovery] evaluation failed for {interview_id}: {exc}",
-                    exc_info=True,
-                )
-            try:
-                logger.info(
-                    f"[recovery] running report for recovered interview {interview_id}"
-                )
-                await run_report(interview_id)
-            except Exception as exc:
-                logger.error(
-                    f"[recovery] report failed for {interview_id}: {exc}",
                     exc_info=True,
                 )
 
@@ -278,16 +282,23 @@ async def expire_abandoned_interviews() -> int:
 
     try:
         async with AsyncSessionLocal() as db:
-            # Scheduled interviews older than 24 h with no transcript
+            # Scheduled interviews older than 24 h with no transcript turns.
+            # Use scheduled_at when set (more accurate); fall back to created_at.
             rows = (await db.execute(
                 select(Interview).where(
                     and_(
                         Interview.status == "scheduled",
-                        Interview.created_at < cutoff,
+                        or_(
+                            and_(Interview.scheduled_at.isnot(None), Interview.scheduled_at < cutoff),
+                            and_(Interview.scheduled_at.is_(None),   Interview.created_at  < cutoff),
+                        ),
                         not_(
                             exists(
                                 select(InterviewTranscript.interview_id).where(
-                                    InterviewTranscript.interview_id == Interview.id
+                                    and_(
+                                        InterviewTranscript.interview_id == Interview.id,
+                                        InterviewTranscript.turn_count > 0,
+                                    )
                                 )
                             )
                         ),

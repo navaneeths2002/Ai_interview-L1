@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 import uuid
@@ -6,12 +7,16 @@ import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+from app.core.logging_config import get_logger
+
 # Silence chatty WebRTC / ICE / charset debug spam from aiortc P2P transport
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 logging.getLogger("aiortc.rtcdtlstransport").setLevel(logging.WARNING)
 logging.getLogger("aioice").setLevel(logging.WARNING)
 logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
+
+logger = get_logger(__name__)
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, RoomInputOptions, cli
 from livekit.agents import llm
@@ -117,7 +122,7 @@ async def _load_interview_context(interview_id: str) -> dict:
             )).fetchone()
 
             if not row:
-                print(f"[agent] WARNING: no interview row for {interview_id}")
+                logger.warning("No interview row found", extra={"interview_id": interview_id})
                 return defaults
 
             tenant_id = row[0]
@@ -141,7 +146,7 @@ async def _load_interview_context(interview_id: str) -> dict:
                 "skills_to_probe": list(ctx_row[1] or []) if ctx_row else [],
             }
     except Exception as e:
-        print(f"[db] interview context lookup failed: {e}")
+        logger.error("Interview context lookup failed", extra={"interview_id": interview_id, "error": str(e)})
         return defaults
 
 
@@ -151,36 +156,57 @@ async def _save_transcript(
     speaker: str,
     message: str,
     spoken_at: datetime,          # ← captured at queue time, not task-run time
+    node: str | None = None,      # LangGraph stage at time of utterance
 ) -> None:
-    """Insert a single transcript row — fire-and-forget, never blocks pipeline."""
+    """
+    Upsert a turn into the single interview_transcripts row for this interview.
+
+    First call   → INSERT a new row with turns = [{...}], turn_count = 1
+    Subsequent   → UPDATE: append to turns array via ||, increment turn_count
+
+    The UNIQUE constraint on interview_id makes ON CONFLICT safe even when
+    multiple fire-and-forget tasks run concurrently.
+    """
     if not message.strip():
         return
     factory = _get_db_factory()
     if not factory:
         return
     now = datetime.now(timezone.utc)
+
+    # Wrap the turn in a JSON array so PostgreSQL's || operator appends it
+    # to the existing turns array atomically.
+    turn_json = json.dumps([{
+        "speaker":   speaker,
+        "message":   message.strip(),
+        "spoken_at": spoken_at.isoformat(),
+        "node":      node,
+    }])
+
     try:
         async with factory() as session:
             await session.execute(
                 text("""
                     INSERT INTO interview_transcripts
-                        (id, tenant_id, interview_id, speaker, message, spoken_at, created_at, updated_at)
+                        (id, tenant_id, interview_id, turns, turn_count, created_at, updated_at)
                     VALUES
-                        (:id, :tenant_id, :interview_id, :speaker, :message, :spoken_at, :now, :now)
+                        (:id, :tenant_id, :interview_id, :turn_json::jsonb, 1, :now, :now)
+                    ON CONFLICT (interview_id) DO UPDATE SET
+                        turns      = interview_transcripts.turns || :turn_json::jsonb,
+                        turn_count = interview_transcripts.turn_count + 1,
+                        updated_at = :now
                 """),
                 {
-                    "id": str(uuid.uuid4()),
-                    "tenant_id": tenant_id,
+                    "id":           str(uuid.uuid4()),
+                    "tenant_id":    tenant_id,
                     "interview_id": interview_id,
-                    "speaker": speaker,
-                    "message": message.strip(),
-                    "spoken_at": spoken_at,   # exact moment the message was said
-                    "now": now,               # created_at/updated_at = DB write time
+                    "turn_json":    turn_json,
+                    "now":          now,
                 },
             )
             await session.commit()
     except Exception as e:
-        print(f"[transcript] save error ({speaker}): {e}")
+        logger.error("Transcript save failed", extra={"speaker": speaker, "interview_id": interview_id, "error": str(e)})
 
 
 async def _update_interview_status(
@@ -195,27 +221,32 @@ async def _update_interview_status(
         return
     now = datetime.now(timezone.utc)
     try:
-        parts = ["status = :status", "updated_at = :now"]
-        params: dict = {"status": status, "interview_id": interview_id, "now": now}
-        if started_at is not None:
-            parts.append("started_at = :started_at")
-            params["started_at"] = started_at
-        if ended_at is not None:
-            parts.append("ended_at = :ended_at")
-            params["ended_at"] = ended_at
-        if duration_seconds is not None:
-            parts.append("duration_seconds = :duration_seconds")
-            params["duration_seconds"] = duration_seconds
-
-        async with _get_db_factory()() as session:
+        # Fixed SQL — no f-string, all values are parameterized.
+        # COALESCE keeps the existing column value when the caller passes None.
+        async with factory() as session:   # uses the already-fetched factory (BUG 7 fix)
             await session.execute(
-                text(f"UPDATE interviews SET {', '.join(parts)} WHERE id = :interview_id"),
-                params,
+                text("""
+                    UPDATE interviews
+                    SET    status           = :status,
+                           updated_at       = :now,
+                           started_at       = COALESCE(:started_at,       started_at),
+                           ended_at         = COALESCE(:ended_at,         ended_at),
+                           duration_seconds = COALESCE(:duration_seconds, duration_seconds)
+                    WHERE  id = :interview_id
+                """),
+                {
+                    "status":           status,
+                    "interview_id":     interview_id,
+                    "now":              now,
+                    "started_at":       started_at,
+                    "ended_at":         ended_at,
+                    "duration_seconds": duration_seconds,
+                },
             )
             await session.commit()
-        print(f"[interview] {interview_id} → {status}")
+        logger.info("Interview status updated", extra={"interview_id": interview_id, "status": status})
     except Exception as e:
-        print(f"[interview] status update error: {e}")
+        logger.error("Interview status update failed", extra={"interview_id": interview_id, "status": status, "error": str(e)})
 
 
 # ── Text extraction ─────────────────────────────────────────────────────────────
@@ -274,19 +305,19 @@ class HRInterviewAgent(Agent):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _queue_save(self, speaker: str, text: str) -> None:
+    def _queue_save(self, speaker: str, text: str, node: str | None = None) -> None:
         if self.interview_id and self.tenant_id and text.strip():
             # Capture timestamp NOW — before the async task runs — so fire-and-forget
             # tasks always write the actual spoken time, not the DB-write time.
             spoken_at = datetime.now(timezone.utc)
             asyncio.create_task(
-                _save_transcript(self.interview_id, self.tenant_id, speaker, text, spoken_at)
+                _save_transcript(self.interview_id, self.tenant_id, speaker, text, spoken_at, node)
             )
 
     def _log_stage(self) -> None:
         stage = self._graph_state.get("stage", "?")
         turns = self._graph_state.get("turns_in_stage", 0)
-        print(f"[graph] stage={stage}  turns_in_stage={turns}")
+        logger.debug("Graph stage advanced", extra={"stage": stage, "turns_in_stage": turns, "interview_id": self.interview_id})
 
     # ── Main hook ─────────────────────────────────────────────────────────────
 
@@ -296,7 +327,7 @@ class HRInterviewAgent(Agent):
         new_message: llm.ChatMessage,
     ) -> None:
         text = _extract_text(new_message).strip()
-        print(f"[stt] heard: '{text}'")   # ← diagnostic: confirms audio reached Deepgram
+        logger.debug("STT transcript received", extra={"text_preview": text[:80], "interview_id": self.interview_id})
         words = text.split()
 
         # Mishear guard
@@ -305,7 +336,7 @@ class HRInterviewAgent(Agent):
             return
 
         # ── Save candidate message (non-blocking) ────────────────────────────
-        self._queue_save("candidate", text)
+        self._queue_save("candidate", text, node=self._graph_state.get("stage"))
 
         # ── Advance LangGraph state with candidate's response ────────────────
         try:
@@ -315,7 +346,7 @@ class HRInterviewAgent(Agent):
             self._graph_state = new_state
             self._log_stage()
         except Exception as e:
-            print(f"[graph] advance error: {e}")
+            logger.error("LangGraph advance error", extra={"interview_id": self.interview_id, "error": str(e)})
 
         # ── Natural pre-response pause ────────────────────────────────────────
         await asyncio.sleep(random.uniform(0.3, 0.6))
@@ -335,7 +366,7 @@ class HRInterviewAgent(Agent):
             if getattr(msg, "role", None) == "assistant":
                 ai_text = _extract_text(msg).strip()
                 if ai_text:
-                    self._queue_save("ai", ai_text)
+                    self._queue_save("ai", ai_text, node=self._graph_state.get("stage"))
                 break
 
     # ── Typed text input ──────────────────────────────────────────────────────
@@ -355,8 +386,9 @@ class HRInterviewAgent(Agent):
         if not text:
             return
 
-        # ── Save candidate message ───────────────────────────────────────────
-        self._queue_save("candidate", text)
+        # NOTE: do NOT call _queue_save here — generate_reply() triggers
+        # on_user_turn_completed() which saves the candidate message and the
+        # AI response in one place.  Saving here too would double-write (BUG 12).
 
         # ── Advance LangGraph state ──────────────────────────────────────────
         try:
@@ -366,7 +398,7 @@ class HRInterviewAgent(Agent):
             self._graph_state = new_state
             self._log_stage()
         except Exception as e:
-            print(f"[graph] advance error (typed): {e}")
+            logger.error("LangGraph advance error (typed input)", extra={"interview_id": self.interview_id, "error": str(e)})
 
         # ── Natural pre-response pause ───────────────────────────────────────
         await asyncio.sleep(random.uniform(0.3, 0.6))
@@ -390,7 +422,7 @@ async def entrypoint(ctx: JobContext):
     interview_id: str | None = None
     if room_name.startswith("interview-"):
         interview_id = room_name[len("interview-"):]
-        print(f"[agent] room={room_name}  interview_id={interview_id}")
+        logger.info("Agent connected to interview room", extra={"room": room_name, "interview_id": interview_id})
 
     # Load context from DB (tenant, candidate name, skills/gaps)
     ctx_data = {}
@@ -403,7 +435,7 @@ async def entrypoint(ctx: JobContext):
     skills_to_probe = ctx_data.get("skills_to_probe", [])
 
     if not tenant_id:
-        print("[agent] WARNING: tenant_id not found — transcripts and status updates disabled")
+        logger.warning("tenant_id not found — transcripts and status updates disabled", extra={"interview_id": interview_id})
 
     # Build initial LangGraph state
     graph_state = make_initial_state(
@@ -411,19 +443,20 @@ async def entrypoint(ctx: JobContext):
         skills_to_probe=skills_to_probe,
         gaps_to_probe=gaps_to_probe,
     )
-    print(f"[graph] initial stage=intro  candidate={candidate_name}")
+    logger.info("LangGraph initialised", extra={"stage": "intro", "candidate": candidate_name, "interview_id": interview_id})
 
-    interview_start_time = datetime.now(timezone.utc)
+    # interview_start_time is set when the CANDIDATE actually joins the room
+    # (not when the agent connects).  Use a mutable list so the closure in
+    # on_shutdown can read the value set later by on_participant_connected.
+    interview_start_time: list[datetime | None] = [None]
 
     # Mutable holder so on_shutdown can reach the avatar even though it's
     # created *after* on_shutdown is defined.
     _avatar_holder: list[AvatarSession] = []
 
-    # Mark interview as in_progress
-    if interview_id and tenant_id:
-        await _update_interview_status(
-            interview_id, "in_progress", started_at=interview_start_time
-        )
+    # NOTE: Do NOT mark in_progress here.  The agent joining the room does not
+    # mean the candidate has joined.  Status is set inside on_participant_connected
+    # below, triggered only when the candidate's browser connects.
 
     session = AgentSession(
         vad=silero.VAD.load(
@@ -458,7 +491,7 @@ async def entrypoint(ctx: JobContext):
             ),
         ),
         allow_interruptions=True,
-        min_interruption_words=2,
+        min_interruption_words=4,  # raised from 2 — prevents false barge-in from coughs/noise
         min_endpointing_delay=0.4,
         max_endpointing_delay=6.0,
     )
@@ -467,27 +500,54 @@ async def entrypoint(ctx: JobContext):
     async def on_shutdown() -> None:
         if interview_id and tenant_id:
             end_time = datetime.now(timezone.utc)
-            duration = int((end_time - interview_start_time).total_seconds())
+            start   = interview_start_time[0]  # None if candidate never joined
+
+            # Only compute duration if the candidate actually joined
+            duration = int((end_time - start).total_seconds()) if start else None
+
             await _update_interview_status(
                 interview_id,
                 "completed",
                 ended_at=end_time,
                 duration_seconds=duration,
             )
-            # Phase 6: trigger evaluation engine as a background task
-            # Local import avoids circular dependency at module level
+            # Phase 6: trigger evaluation engine directly (await, not create_task)
+            # Using create_task inside a shutdown callback is unreliable because
+            # the event loop may already be winding down.
             try:
                 from app.services.evaluation_engine import run_evaluation
-                asyncio.create_task(run_evaluation(interview_id))
-                print(f"[eval] evaluation task queued for {interview_id}")
+                await run_evaluation(interview_id)
+                logger.info("Post-interview evaluation complete", extra={"interview_id": interview_id})
             except Exception as e:
-                print(f"[eval] failed to queue evaluation: {e}")
+                logger.error("Post-interview evaluation failed", extra={"interview_id": interview_id, "error": str(e)})
 
         # Stop avatar session if it was started
         if _avatar_holder:
             await _avatar_holder[0].stop()
 
     ctx.add_shutdown_callback(on_shutdown)
+
+    # ── Mark in_progress only when the CANDIDATE joins ────────────────────────
+    # This fires for every remote participant.  We filter by identity prefix
+    # to skip the simli-avatar participant that also joins the same room.
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant) -> None:
+        if not interview_id or not tenant_id:
+            return
+        # Only act on the candidate — skip simli-avatar and any other agents
+        if participant.identity == "simli-avatar":
+            return
+        if not participant.identity.startswith("candidate-"):
+            return
+
+        # Capture start time at the moment the candidate's browser connects
+        interview_start_time[0] = datetime.now(timezone.utc)
+        logger.info("Candidate joined room", extra={"identity": participant.identity, "interview_id": interview_id})
+        asyncio.create_task(
+            _update_interview_status(
+                interview_id, "in_progress", started_at=interview_start_time[0]
+            )
+        )
 
     hr_agent = HRInterviewAgent(
         graph_state=graph_state,
@@ -511,10 +571,10 @@ async def entrypoint(ctx: JobContext):
             if getattr(data_packet, "topic", None) == "text_input":
                 text = data_packet.data.decode("utf-8").strip()
                 if text:
-                    print(f"[agent] text input received: {text[:80]}")
+                    logger.debug("Text input received", extra={"text_preview": text[:80], "interview_id": interview_id})
                     asyncio.create_task(hr_agent.handle_typed_input(text))
         except Exception as e:
-            print(f"[agent] data_received error: {e}")
+            logger.error("data_received handler error", extra={"interview_id": interview_id, "error": str(e)})
 
     # ── Avatar (optional — gracefully disabled if Simli keys not set) ────────
     avatar = AvatarSession()
@@ -540,17 +600,17 @@ async def entrypoint(ctx: JobContext):
                 timeout=8.0,
             )
         except asyncio.TimeoutError:
-            print("[avatar] Simli start timed out (>8s) — voice-only mode")
+            logger.warning("Simli start timed out (>8s) — falling back to voice-only", extra={"interview_id": interview_id})
             await avatar.stop()
             simli_forwarder = None
     else:
-        print("[avatar] SIMLI_API_KEY or SIMLI_FACE_ID not set — voice-only mode")
+        logger.info("SIMLI_API_KEY or SIMLI_FACE_ID not set — voice-only mode", extra={"interview_id": interview_id})
 
     if simli_forwarder is not None:
         session.output.audio = simli_forwarder
-        print("[avatar] Simli avatar active — face video published to room")
+        logger.info("Simli avatar active — face video published to room", extra={"interview_id": interview_id})
     else:
-        print("[avatar] running in voice-only mode")
+        logger.info("Running in voice-only mode", extra={"interview_id": interview_id})
 
     await session.generate_reply(
         instructions=(

@@ -14,7 +14,7 @@ class InterviewReport(BaseModel):
     """Recruiter-ready report generated after evaluation completes."""
     __tablename__ = "interview_reports"
 
-    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
 
     # Denormalised for fast access
     candidate_name:  Mapped[str] = mapped_column(String(255), nullable=True)

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     # Application
     app_name: str = "interview-agent"
     app_env: str = "development"
-    secret_key: str = "dev-secret-key"
+    secret_key: str  # Required — no default. Server fails at startup if SECRET_KEY missing from .env.
     app_base_url: str = "http://localhost:8000"
 
     # Database

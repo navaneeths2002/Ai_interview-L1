@@ -33,22 +33,26 @@ logger = logging.getLogger(__name__)
 
 # ── Transcript highlight picker ────────────────────────────────────────────────
 
-def _pick_highlights(transcripts: list, max_pairs: int = 5) -> list[dict]:
-    """Return up to max_pairs Q-A exchange dicts from the transcript."""
+def _pick_highlights(turns: list, max_pairs: int = 5) -> list[dict]:
+    """
+    Return up to max_pairs Q-A exchange dicts from the transcript.
+    `turns` is a list of dicts: {"speaker": "ai"|"candidate", "message": "..."}
+    (the JSONB array from the redesigned interview_transcripts table).
+    """
     highlights = []
-    msgs = list(transcripts)
     i = 0
-    while i < len(msgs) and len(highlights) < max_pairs:
-        if msgs[i].speaker == "ai":
-            ai_msg = msgs[i].message
+    while i < len(turns) and len(highlights) < max_pairs:
+        turn = turns[i]
+        if turn.get("speaker") == "ai":
+            ai_msg = turn.get("message", "")
             # Find next candidate reply
             j = i + 1
-            while j < len(msgs) and msgs[j].speaker == "ai":
+            while j < len(turns) and turns[j].get("speaker") == "ai":
                 j += 1
-            if j < len(msgs):
+            if j < len(turns):
                 highlights.append({
                     "question": ai_msg,
-                    "answer":   msgs[j].message,
+                    "answer":   turns[j].get("message", ""),
                 })
                 i = j + 1
             else:
@@ -430,12 +434,12 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         )
     )).scalar_one_or_none()
 
-    # Transcript
-    transcripts = (await db.execute(
+    # Transcript — single row per interview, ordered JSONB array of turns
+    transcript_row = (await db.execute(
         select(InterviewTranscript)
         .where(InterviewTranscript.interview_id == interview_id)
-        .order_by(InterviewTranscript.spoken_at)
-    )).scalars().all()
+    )).scalar_one_or_none()
+    turns = transcript_row.turns if transcript_row else []
 
     # Pull narrative content from raw_extraction (saved by evaluation engine)
     raw = (ext_row.raw_extraction or {}) if ext_row else {}
@@ -485,7 +489,7 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
                                 if profile.get("total_experience_years") else None,
         },
 
-        "transcript_highlights": _pick_highlights(list(transcripts), max_pairs=5),
+        "transcript_highlights": _pick_highlights(turns, max_pairs=5),
     }
 
     return report_data

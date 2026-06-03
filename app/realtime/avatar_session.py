@@ -75,23 +75,30 @@ class SimliAudioForwarder(io.AudioOutput):
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         await super().capture_frame(frame)   # bookkeeping only
 
-        # Convert stereo → mono
-        raw = bytes(frame.data)
-        if frame.num_channels == 2:
-            raw = audioop.tomono(raw, 2, 0.5, 0.5)
-
-        pcm16 = _resample(raw, frame.sample_rate)
-
-        # Buffer and ship in 6 kB chunks
-        self._buf.extend(pcm16)
-        while len(self._buf) >= _SIMLI_CHUNK_BYTES:
-            chunk = bytes(self._buf[:_SIMLI_CHUNK_BYTES])
-            self._buf = self._buf[_SIMLI_CHUNK_BYTES:]
-            asyncio.create_task(self._safe_send(chunk))
-
-        # Forward to room audio so candidate hears the voice
+        # ── Room audio FIRST — candidate must always hear the AI voice ────────
+        # This runs before Simli processing so a Simli error can never silence
+        # the candidate's audio (BUG 3 / BUG 4 fix).
         if self.next_in_chain:
-            await self.next_in_chain.capture_frame(frame)
+            try:
+                await self.next_in_chain.capture_frame(frame)
+            except Exception as e:
+                logger.warning(f"[audio] next_in_chain error (candidate may miss audio): {e}")
+
+        # ── Simli lip-sync path — best-effort, errors are non-fatal ──────────
+        try:
+            raw = bytes(frame.data)
+            if frame.num_channels == 2:
+                raw = audioop.tomono(raw, 2, 0.5, 0.5)
+
+            pcm16 = _resample(raw, frame.sample_rate)
+
+            self._buf.extend(pcm16)
+            while len(self._buf) >= _SIMLI_CHUNK_BYTES:
+                chunk = bytes(self._buf[:_SIMLI_CHUNK_BYTES])
+                self._buf = self._buf[_SIMLI_CHUNK_BYTES:]
+                asyncio.create_task(self._safe_send(chunk))
+        except Exception as e:
+            logger.debug(f"[simli] capture_frame error: {e}")
 
     def flush(self) -> None:
         if self._buf:
@@ -271,6 +278,22 @@ class AvatarSession:
                 self._publisher.render_loop(),
                 name="simli-render",
             )
+
+            # Detect silent render loop exit so we can log it.
+            # The browser falls back to the plasma canvas when video stops.
+            def _on_render_done(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return  # normal stop() shutdown — expected
+                exc = task.exception() if not task.cancelled() else None
+                if exc:
+                    logger.warning(f"[avatar] render loop crashed: {exc} — video gone black")
+                else:
+                    logger.warning(
+                        "[avatar] render loop exited normally — Simli stream ended "
+                        "(video will be black; browser plasma canvas fallback active)"
+                    )
+
+            self._render_task.add_done_callback(_on_render_done)
 
             # Build the audio forwarder (Simli side + room side via next_in_chain)
             forwarder = SimliAudioForwarder(

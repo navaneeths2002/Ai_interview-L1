@@ -7,11 +7,12 @@ POST /api/v1/interviews/{id}/report       → trigger / re-generate report
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.rate_limiter import limiter, LIMIT_REPORT
 from app.db.session import get_db
 from app.models.interview import Interview
 from app.models.report import InterviewReport
@@ -76,7 +77,9 @@ async def get_report_html(
 # ── POST /api/v1/interviews/{id}/report ──────────────────────────────────────
 
 @router.post("/interviews/{interview_id}/report", status_code=202)
+@limiter.limit(LIMIT_REPORT)
 async def trigger_report(
+    request: Request,
     interview_id: str,
     db: AsyncSession = Depends(get_db),
     x_tenant_id: str = Header(..., alias="X-Tenant-ID"),
