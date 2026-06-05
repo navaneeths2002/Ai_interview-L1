@@ -580,7 +580,8 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
 
 <script>
 'use strict';
-const interviewId = location.pathname.split('/').filter(Boolean).pop();
+const interviewId  = location.pathname.split('/').filter(Boolean).pop();
+const inviteToken  = new URLSearchParams(location.search).get('token') || '';
 let room = null;
 let cachedTokenData = null; // prefetched on load, reused on Start
 
@@ -624,7 +625,7 @@ function showInterviewOver(status, candidateName) {
 // ── Prefetch interview info → candidate name ──────────────────────────────────
 (async function prefetchInterviewInfo() {
   try {
-    const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
+    const res = await fetch('/api/v1/interviews/' + interviewId + '/token?token=' + encodeURIComponent(inviteToken));
     if (!res.ok) return;
     cachedTokenData = await res.json();
 
@@ -1216,7 +1217,7 @@ async function startInterview() {
     // Use prefetched token data if available, otherwise fetch now
     let data = cachedTokenData;
     if (!data) {
-      const res = await fetch('/api/v1/interviews/' + interviewId + '/token');
+      const res = await fetch('/api/v1/interviews/' + interviewId + '/token?token=' + encodeURIComponent(inviteToken));
       data = await res.json();
       if (!res.ok) {
         document.getElementById('startBtn').disabled = false;

@@ -59,7 +59,7 @@ Handling typed text and spelling corrections:
 """
 
 # Short filler lines spoken before the main LLM response (20% of turns)
-_FILLERS = ["Hmm.", "Right.", "I see.", "Okay.", "Sure.", "Got it."]
+_FILLERS = ["Hmm.", "Right.", "I see.", "Okay.", "Sure.", "Got it." , "Aha!", "Gotcha."]
 
 # Responses when transcript is too short to be a real answer
 _MISHEAR = [
@@ -511,6 +511,20 @@ async def entrypoint(ctx: JobContext):
                 ended_at=end_time,
                 duration_seconds=duration,
             )
+
+            # Drain all pending transcript save tasks before running evaluation.
+            # _queue_save() fires create_task() calls throughout the interview.
+            # Those tasks may still be in-flight when on_shutdown fires.
+            # Yielding to the event loop here lets them all complete so the
+            # transcript is fully written before evaluation reads it.
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if pending:
+                logger.info(
+                    f"Waiting for {len(pending)} pending task(s) to flush before evaluation",
+                    extra={"interview_id": interview_id},
+                )
+                await asyncio.gather(*pending, return_exceptions=True)
+
             # Phase 6: trigger evaluation engine directly (await, not create_task)
             # Using create_task inside a shutdown callback is unreliable because
             # the event loop may already be winding down.

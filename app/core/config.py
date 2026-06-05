@@ -52,5 +52,8 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     email_from: str = "noreply@yourapp.com"
 
+    # Invite token
+    invite_token_expire_hours: int = 24  # How long the candidate join link stays valid
+
 
 settings = Settings()

@@ -3,7 +3,7 @@
 **Author:** Navaneeth S (aimlteam@interbiz.in)
 **Type:** SaaS HRMS microservice
 **Stack:** Python 3.12 · FastAPI · PostgreSQL · LiveKit · Deepgram · ElevenLabs · Anthropic Claude · Simli
-**Status:** Phase 7 + Avatar complete — full pipeline live
+**Status:** Phases 1–9 complete + Signed Invite Token auth live
 
 ---
 
@@ -13,11 +13,13 @@ This is the **AI-powered L1 (first-round) HR screening** microservice for an exi
 
 1. Receives the candidate's parsed resume + ATS score + job description
 2. Builds a personalised interview strategy using Claude
-3. Creates a LiveKit voice room and sends the candidate a join link
-4. Conducts a full voice interview via the browser — a real-time animated human avatar acts as the HR interviewer
-5. Stores the full transcript to PostgreSQL in real time
-6. Evaluates the candidate post-interview using Claude (scores communication, confidence, JD fit, behavioral)
-7. Generates a recruiter-ready HTML report (print-to-PDF) — auto-triggered after evaluation
+3. Creates a LiveKit voice room
+4. Generates a **signed invite token** and embeds it in the join link
+5. Emails the secure join link to the candidate automatically
+6. Conducts a full voice interview via the browser — a real-time animated human avatar acts as the HR interviewer
+7. Stores the full transcript to PostgreSQL in real time
+8. Evaluates the candidate post-interview using Claude (scores communication, confidence, JD fit, behavioral)
+9. Generates a recruiter-ready HTML report (print-to-PDF) — auto-triggered after evaluation
 
 The service is **fully autonomous** — zero human involvement needed until the recruiter reviews the report.
 
@@ -31,13 +33,17 @@ interview-agent/
 │   ├── main.py                        # FastAPI entry point — includes all routers
 │   ├── core/
 │   │   ├── config.py                  # Pydantic settings (reads .env)
-│   │   └── middleware.py              # TenantMiddleware — X-Tenant-ID enforcement
+│   │   ├── middleware.py              # TenantMiddleware — X-Tenant-ID enforcement
+│   │   ├── security.py                # create_invite_token() + verify_invite_token()
+│   │   ├── rate_limiter.py            # slowapi rate limiting (per tenant + per IP)
+│   │   └── logging_config.py          # Structured JSON logging (prod) / readable (dev)
 │   ├── api/v1/routes/
 │   │   ├── health.py                  # GET /health
 │   │   ├── interviews.py              # POST /api/v1/interviews/trigger
-│   │   ├── session.py                 # GET /api/v1/interviews/{id}/token
+│   │   ├── session.py                 # GET /api/v1/interviews/{id}/token  ← requires signed token
 │   │   ├── evaluation.py              # GET|POST /api/v1/interviews/{id}/evaluate
-│   │   └── reports.py                 # GET|POST /api/v1/interviews/{id}/report[/html]
+│   │   ├── reports.py                 # GET|POST /api/v1/interviews/{id}/report[/html]
+│   │   └── recovery.py                # GET /admin/recovery/status  POST /admin/recovery/run
 │   ├── models/
 │   │   ├── base.py                    # BaseModel: id (UUID), tenant_id, timestamps
 │   │   ├── candidate.py               # Candidate + CandidateProfile
@@ -52,9 +58,13 @@ interview-agent/
 │   │   ├── resume_extractor.py        # Parses ATS resume JSON → structured dict
 │   │   ├── ats_extractor.py           # Parses ATS score JSON → missing skills, flags
 │   │   ├── strategy_builder.py        # Claude → personalised interview strategy
-│   │   ├── context_builder.py         # Orchestrates extraction + DB saves
+│   │   ├── context_builder.py         # Orchestrates extraction + DB saves + email invite
+│   │   ├── email_service.py           # Sends interview invite email via SMTP
 │   │   ├── evaluation_engine.py       # Post-interview Claude scoring (Phase 6)
-│   │   └── report_generator.py        # HTML + JSON report builder (Phase 7)
+│   │   ├── report_generator.py        # HTML + JSON report builder (Phase 7)
+│   │   └── recovery.py                # Crash recovery functions (Phase 8)
+│   ├── workers/
+│   │   └── scheduler.py               # APScheduler — 4 periodic recovery jobs
 │   ├── realtime/
 │   │   ├── room_manager.py            # LiveKit room creation + token generation
 │   │   ├── agent.py                   # Voice agent worker (separate process)
@@ -66,6 +76,13 @@ interview-agent/
 │       └── interview.html             # Candidate browser page (LiveKit JS + Simli video)
 ├── alembic/                           # Database migrations
 │   └── versions/                      # Auto-generated migration files
+├── systemd/
+│   ├── interview-api.service          # Systemd unit — FastAPI server
+│   └── interview-worker.service       # Systemd unit — LiveKit agent worker
+├── scripts/
+│   ├── setup_ubuntu.sh                # One-time EC2 Ubuntu setup
+│   ├── deploy.sh                      # Pull → migrate → restart + health check
+│   └── backup_db.sh                   # PostgreSQL backup (14-day retention)
 ├── requirements.txt
 └── .env                               # API keys (never commit)
 ```
@@ -98,25 +115,80 @@ Headers:
   Content-Type: application/json
 
 Body: {
-  "ats_candidate_id": "...",
-  "candidate_name": "Rajiv Chaudhary",
-  "candidate_email": "rajiv@example.com",
-  "candidate_phone": "9876543210",
-  "resume_filename": "Rajiv_Chaudhary.pdf",
+  "ats_candidate_id": "CAND-001",
+  "candidate_name": "Navaneeth S",
+  "candidate_email": "candidate@example.com",
+  "candidate_phone": "+91XXXXXXXXXX",
+  "resume_filename": "Navaneeth_S.pdf",
   "parsed_resume": { ...ATS resume parser response... },
-  "ats_score_data": { ...ATS score response... },
-  "job": { ...job details... }
+  "ats_score_data": { ...ATS scorer response... },
+  "job": { ...job details from ATS... }
 }
 ```
 
-Response includes `join_url` — send to the candidate. When they open it and click **Start Interview**, the agent worker picks up the room automatically.
+Response includes `join_url` — this is a **signed secure link** automatically emailed to the candidate.
+
+```json
+{
+  "interview_id": "...",
+  "candidate_id": "...",
+  "status": "scheduled",
+  "join_url": "http://localhost:8000/interview/{id}?token=eyJhbGci...",
+  "message": "Interview scheduled for Navaneeth S. Missing skills: FastAPI, Docker..."
+}
+```
+
+---
+
+## Signed Invite Token (Candidate Auth)
+
+When an interview is triggered, the system generates a **signed JWT invite token** embedded in the join link.
+
+**Files:**
+- `app/core/security.py` — `create_invite_token()` + `verify_invite_token()`
+- `app/services/email_service.py` — sends invite email via SMTP
+
+**Token payload:**
+```json
+{
+  "type": "invite",
+  "interview_id": "...",
+  "candidate_email": "...",
+  "exp": "<24 hours from creation>"
+}
+```
+
+**How it works:**
+```
+Trigger interview → signed token generated → join_url = /interview/{id}?token=...
+        ↓
+Email sent to candidate automatically (fire-and-forget)
+        ↓
+Candidate clicks link → browser reads ?token from URL
+        ↓
+Page calls GET /interviews/{id}/token?token=...
+        ↓
+Server verifies: genuine signature? ✅  not expired? ✅  matches interview? ✅
+        ↓
+LiveKit room token issued → interview starts
+```
+
+If no token → 401. Expired or tampered → 401.
+
+**Config:**
+```env
+INVITE_TOKEN_EXPIRE_HOURS=24   # default: 24 hours
+```
+
+**Email is skipped silently** if `SMTP_USER` / `SMTP_PASSWORD` are not set in `.env`.
 
 ---
 
 ## Full Pipeline (end-to-end)
 
 ```
-Candidate joins room (browser)
+Candidate clicks secure join link (email)
+    → Token verified by server
     → Simli avatar appears (real-time animated face)
     → Agent greets candidate
     ↓
@@ -181,11 +253,6 @@ SIMLI_FACE_ID=...   # Upload HR persona photo at simli.com → get face_id
 
 If keys are missing, avatar is disabled silently — interview continues voice-only.
 
-**Browser side (interview.html):**
-- Subscribes to `simli-avatar` participant's video track on `TrackSubscribed`
-- Attaches to `<video id="avatar-video">` element (positioned over the plasma canvas, `border-radius:50%`)
-- Plasma canvas is hidden when Simli video arrives; shown as fallback if avatar never connects
-
 ---
 
 ## Evaluation Engine (Phase 6)
@@ -234,10 +301,25 @@ GET /api/v1/interviews/{id}/report
 Headers: X-Tenant-ID: tenant-001
 ```
 
-**Regenerate report:**
+---
+
+## Crash Recovery (Phase 8)
+
+**Files:** `app/services/recovery.py` + `app/workers/scheduler.py`
+
+Four recovery functions run on startup and periodically via APScheduler:
+
+| Function | Interval | What it does |
+|---|---|---|
+| `recover_stuck_interviews` | Every 15 min | in_progress > 2h → mark completed + run evaluation |
+| `retry_missing_evaluations` | Every 10 min | completed but no score → re-run evaluation |
+| `retry_missing_reports` | Every 10 min | scored but no report → re-run report |
+| `expire_abandoned_interviews` | Every 60 min | scheduled > 24h + 0 transcript turns → mark expired |
+
+**Admin endpoints:**
 ```
-POST /api/v1/interviews/{id}/report
-Headers: X-Tenant-ID: tenant-001
+GET  /api/v1/admin/recovery/status   Headers: X-Tenant-ID: tenant-001
+POST /api/v1/admin/recovery/run      Headers: X-Tenant-ID: tenant-001
 ```
 
 ---
@@ -249,6 +331,9 @@ Headers: X-Tenant-ID: tenant-001
 APP_ENV=development
 APP_BASE_URL=http://localhost:8000
 SECRET_KEY=dev-secret-key
+
+# Invite Token
+INVITE_TOKEN_EXPIRE_HOURS=24
 
 # Database
 DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/interview_agent
@@ -280,7 +365,7 @@ S3_BUCKET_NAME=...
 ATS_BASE_URL=...
 ATS_SERVICE_TOKEN=...
 
-# Email
+# Email (optional — invite email skipped if not set)
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=...
@@ -307,9 +392,9 @@ venv\Scripts\python -m alembic revision --autogenerate -m "description"
 | `candidate_profiles` | Skills, experience, certifications |
 | `jobs` | Job/position details |
 | `ats_scores` | ATS pre-score per candidate+job |
-| `interviews` | Interview lifecycle (status, timing) |
+| `interviews` | Interview lifecycle (status, timing, join_url, join_expires_at) |
 | `interview_contexts` | Strategy, gaps, skills to probe |
-| `interview_transcripts` | Full turn-by-turn transcript |
+| `interview_transcripts` | Full turn-by-turn transcript (JSONB) |
 | `interview_extracted_data` | CTC, notice, relocation, raw_extraction JSONB |
 | `interview_scores` | Evaluation scores (all dimensions) |
 | `interview_reports` | Final recruiter report (HTML + JSON + URL) |
@@ -321,7 +406,7 @@ venv\Scripts\python -m alembic revision --autogenerate -m "description"
 Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header **except**:
 - `/health`, `/docs`, `/openapi.json`, `/redoc`
 - `/interview/*`, `/static/*`
-- `/api/v1/interviews/{id}/token`
+- `/api/v1/interviews/{id}/token`  ← uses signed invite token instead
 - `/api/v1/interviews/{id}/report/html`  ← browser-opened URL, no headers possible
 
 ---
@@ -330,13 +415,15 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/v1/interviews/trigger` | Tenant | Trigger new interview |
-| GET | `/api/v1/interviews/{id}/token` | None | Get LiveKit token (candidate) |
-| GET | `/api/v1/interviews/{id}/evaluation` | Tenant | Get evaluation scores |
-| POST | `/api/v1/interviews/{id}/evaluate` | Tenant | Manually trigger evaluation |
-| GET | `/api/v1/interviews/{id}/report` | Tenant | Get JSON report |
-| GET | `/api/v1/interviews/{id}/report/html` | **None** | View HTML report in browser |
-| POST | `/api/v1/interviews/{id}/report` | Tenant | Trigger/regenerate report |
+| POST | `/api/v1/interviews/trigger` | X-Tenant-ID | Trigger new interview + send invite email |
+| GET | `/api/v1/interviews/{id}/token` | Signed invite token (?token=) | Get LiveKit token (candidate) |
+| GET | `/api/v1/interviews/{id}/evaluation` | X-Tenant-ID | Get evaluation scores |
+| POST | `/api/v1/interviews/{id}/evaluate` | X-Tenant-ID | Manually trigger evaluation |
+| GET | `/api/v1/interviews/{id}/report` | X-Tenant-ID | Get JSON report |
+| GET | `/api/v1/interviews/{id}/report/html` | None | View HTML report in browser |
+| POST | `/api/v1/interviews/{id}/report` | X-Tenant-ID | Trigger/regenerate report |
+| GET | `/api/v1/admin/recovery/status` | X-Tenant-ID | Recovery health check |
+| POST | `/api/v1/admin/recovery/run` | X-Tenant-ID | Manually trigger recovery |
 | GET | `/health` | None | Health check |
 
 ---
@@ -353,8 +440,21 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 6 | ✅ Done | Evaluation engine — Claude Haiku post-interview scoring |
 | 7 | ✅ Done | Recruiter report — HTML + JSON, auto-triggered, print-to-PDF |
 | 7.5 | ✅ Done | Simli real-time human avatar — lip-sync face video in browser |
-| 8 | 🔲 | Workflow durability + crash recovery |
-| 9 | 🔲 | Hardening — rate limiting, structured logging, EC2 deployment |
+| 8 | ✅ Done | Workflow durability + crash recovery (APScheduler + 4 recovery jobs) |
+| 9 | ✅ Done | Hardening — rate limiting, structured logging, systemd + EC2 scripts |
+| 10 | ✅ Done | Signed invite token — secure candidate join link + auto email invite |
+
+---
+
+## Next Features (Planned)
+
+| Feature | Description |
+|---|---|
+| Email verification on join page | Candidate must enter email before interview starts — verified against token |
+| Telephony (phone interviews) | FreeSWITCH/Asterisk — call candidate directly, no browser needed |
+| Recruiter dashboard | UI for transcript, scores, approve/reject, forward to L2 |
+| JWT for recruiter APIs | Replace X-Tenant-ID with proper Bearer token auth for HRMS integration |
+| Multi-agent architecture | Separate HR, Technical, Fraud Detection, Observer, Summary agents |
 
 ---
 
@@ -366,3 +466,4 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 - **Simli is optional:** If `SIMLI_API_KEY` or `SIMLI_FACE_ID` is missing, avatar is silently disabled — voice-only mode.
 - **Audio model on account:** Only `claude-haiku-4-5-20251001` confirmed available. `claude-3-5-sonnet` and `claude-sonnet-4-5-20251001` are NOT on this account.
 - **Room max_participants = 3:** Agent + candidate + simli-avatar. Do not lower this.
+- **Email is optional:** If SMTP not configured, invite email is skipped — join_url is still returned in the trigger response and can be shared manually.

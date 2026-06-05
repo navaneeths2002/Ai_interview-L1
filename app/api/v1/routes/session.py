@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.rate_limiter import limiter, LIMIT_TOKEN, _get_remote_ip
+from app.core.security import verify_invite_token
 from app.db.session import get_db
 from app.models.interview import Interview
 from app.models.candidate import Candidate
@@ -24,6 +26,7 @@ _TERMINAL_STATUSES = {"completed", "expired", "failed"}
 async def get_candidate_token(
     request: Request,
     interview_id: str,
+    token: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -31,10 +34,25 @@ async def get_candidate_token(
     Returns a LiveKit token to enter the voice room.
     No X-Tenant-ID required — candidate doesn't know their tenant.
 
+    Requires a signed invite token passed as ?token= query param.
+    The token is generated when the interview is triggered and embedded
+    in the join link that is emailed to the candidate.
+
     For terminal interviews (completed / expired / failed) returns 200 with
     token=null and status set — the browser shows a clean "interview over" screen
     instead of a broken page or a raw JS alert.
     """
+    # Validate signed invite token before doing anything else
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing invite token. Please use the link sent to your email.",
+        )
+    try:
+        verify_invite_token(token, interview_id)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
     result = await db.execute(
         select(Interview).where(Interview.id == interview_id)
     )

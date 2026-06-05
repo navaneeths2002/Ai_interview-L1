@@ -1,8 +1,11 @@
+import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+from app.core.security import create_invite_token
 from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.ats_score import AtsScore
@@ -12,6 +15,7 @@ from app.realtime.room_manager import create_interview_room
 from app.services.resume_extractor import extract_resume_data
 from app.services.ats_extractor import extract_ats_data
 from app.services.strategy_builder import build_interview_strategy
+from app.services.email_service import send_interview_invite
 
 
 async def build_interview_context(
@@ -120,7 +124,17 @@ async def build_interview_context(
     # Step 8 — Create LiveKit room + interview record
     interview_id = str(uuid.uuid4())
     await create_interview_room(interview_id)
-    join_url = f"http://localhost:8000/interview/{interview_id}"
+
+    # Generate a signed invite token — embedded in the join link so only the
+    # intended candidate (with this link) can enter the room.
+    invite_token = create_invite_token(
+        interview_id=interview_id,
+        candidate_email=candidate.email,
+    )
+    join_url = (
+        f"{settings.app_base_url}/interview/{interview_id}"
+        f"?token={invite_token}"
+    )
 
     interview = Interview(
         id=interview_id,
@@ -130,7 +144,7 @@ async def build_interview_context(
         status="scheduled",
         mode="browser",
         join_url=join_url,
-        join_expires_at=datetime.now(timezone.utc) + timedelta(hours=48),
+        join_expires_at=datetime.now(timezone.utc) + timedelta(hours=settings.invite_token_expire_hours),
         scheduled_at=datetime.now(timezone.utc),
     )
     db.add(interview)
@@ -150,6 +164,15 @@ async def build_interview_context(
     db.add(context)
 
     await db.flush()
+
+    # Send invite email to candidate (fire-and-forget — never blocks the API response)
+    asyncio.create_task(send_interview_invite(
+        candidate_name=f"{candidate.first_name} {candidate.last_name}",
+        candidate_email=candidate.email,
+        job_title=job_input.position_title,
+        join_url=join_url,
+        expire_hours=settings.invite_token_expire_hours,
+    ))
 
     return {
         "interview_id": interview_id,

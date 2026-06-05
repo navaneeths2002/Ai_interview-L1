@@ -28,7 +28,7 @@ from app.models.interview import (
 )
 from app.models.report import InterviewReport
 from app.services.evaluation_engine import run_evaluation
-# run_report is NOT imported here — run_evaluation chains it internally.
+from app.services.report_generator import run_report
 
 logger = logging.getLogger(__name__)
 
