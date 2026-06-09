@@ -50,6 +50,7 @@ async def get_report(
         "position_title": report.position_title,
         "overall_score":  report.overall_score,
         "recommendation": report.recommendation,
+        "report_url":     report.report_url,
         "report":         report.report_data,
     }
 

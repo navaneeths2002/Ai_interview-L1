@@ -92,19 +92,8 @@ async def get_evaluation(
         "ai_reasoning": score.ai_reasoning,
 
         # ── Extracted interview data ───────────────────────────────────────────
-        "extracted_data": {
-            "current_company":       extracted.current_company       if extracted else None,
-            "current_role":          extracted.current_role          if extracted else None,
-            "total_experience_years":extracted.total_experience_years if extracted else None,
-            "current_ctc":           extracted.current_ctc           if extracted else None,
-            "expected_ctc":          extracted.expected_ctc          if extracted else None,
-            "notice_period_days":    extracted.notice_period_days    if extracted else None,
-            "notice_negotiable":     extracted.notice_negotiable     if extracted else None,
-            "relocation_willing":    extracted.relocation_willing    if extracted else None,
-            "preferred_locations":   extracted.preferred_locations   if extracted else [],
-            "work_authorization":    extracted.work_authorization    if extracted else None,
-            "earliest_joining":      extracted.earliest_joining      if extracted else None,
-        } if extracted else None,
+        # Data lives in extracted JSONB column (not individual typed columns)
+        "extracted_data": extracted.extracted if extracted else None,
     }
 
 

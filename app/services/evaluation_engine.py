@@ -124,9 +124,20 @@ def _build_prompt(
         if p.get("current_role"):
             lines.append(f"- Current role      : {p['current_role']}")
         if p.get("skills"):
-            lines.append(f"- Skills            : {', '.join(p['skills'])}")
+            # skills is a list of strings
+            skills = [s if isinstance(s, str) else str(s) for s in p['skills']]
+            lines.append(f"- Skills            : {', '.join(skills)}")
         if p.get("certifications"):
-            lines.append(f"- Certifications    : {', '.join(p['certifications'])}")
+            # certifications can be a list of strings OR list of dicts
+            # {"certification_name": "...", "issuing_organization": "..."}
+            certs = []
+            for c in p["certifications"]:
+                if isinstance(c, str):
+                    certs.append(c)
+                elif isinstance(c, dict):
+                    certs.append(c.get("certification_name") or c.get("name") or str(c))
+            if certs:
+                lines.append(f"- Certifications    : {', '.join(certs)}")
 
     # ── Job requirements ───────────────────────────────────────────────────────
     if job:
