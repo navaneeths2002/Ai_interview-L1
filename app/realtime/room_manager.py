@@ -17,7 +17,7 @@ async def create_interview_room(interview_id: str) -> str:
         await lk.room.create_room(
             CreateRoomRequest(
                 name=room_name,
-                empty_timeout=300,
+                empty_timeout=30,    # close room 30s after last participant leaves
                 max_participants=3,  # agent + candidate + simli-avatar
             )
         )

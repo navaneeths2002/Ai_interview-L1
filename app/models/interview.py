@@ -36,7 +36,8 @@ class InterviewContext(BaseModel):
     """AI-generated interview strategy built from resume + ATS score + JD."""
     __tablename__ = "interview_contexts"
 
-    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # unique=True prevents duplicate context rows when context_builder is retried
+    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
 
     # What to verify from resume claims
     skills_to_validate: Mapped[list] = mapped_column(ARRAY(Text), nullable=True)

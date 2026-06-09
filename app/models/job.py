@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, BigInteger, Text
+from sqlalchemy import String, Integer, BigInteger, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -7,6 +7,10 @@ from app.models.base import BaseModel
 
 class Job(BaseModel):
     __tablename__ = "jobs"
+    __table_args__ = (
+        # Prevent duplicate job rows when ATS retries or replays a trigger.
+        UniqueConstraint("tenant_id", "ats_job_id", name="uq_jobs_tenant_ats_id"),
+    )
 
     # ID from the ATS system
     ats_job_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)

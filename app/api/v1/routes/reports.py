@@ -7,12 +7,14 @@ POST /api/v1/interviews/{id}/report       → trigger / re-generate report
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends, Header, Request
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.rate_limiter import limiter, LIMIT_REPORT
+from app.core.security import verify_report_token
 from app.db.session import get_db
 from app.models.interview import Interview
 from app.models.report import InterviewReport
@@ -57,13 +59,27 @@ async def get_report(
 @router.get("/interviews/{interview_id}/report/html", response_class=HTMLResponse)
 async def get_report_html(
     interview_id: str,
+    token: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Returns the pre-rendered HTML report.
-    No tenant header required — this URL is meant to be opened directly in a browser.
+    Requires a signed report access token passed as ?token= query param.
+    The token is embedded in report_url when the report is generated.
     Use Ctrl+P → Save as PDF for a shareable document.
     """
+    # Validate signed report token — prevents unauthenticated access to any
+    # candidate's report by guessing interview UUIDs.
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Report access token required. Use the link from the recruiter dashboard.",
+        )
+    try:
+        verify_report_token(token, interview_id)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
     report = await _get_report_row(db, interview_id)
     if not report or not report.report_html:
         raise HTTPException(

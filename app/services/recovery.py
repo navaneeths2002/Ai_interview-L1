@@ -99,8 +99,13 @@ async def recover_stuck_interviews() -> int:
                 if first_ts and last_ts and last_ts > first_ts:
                     duration = int((last_ts - first_ts).total_seconds())
                 elif interview.started_at:
+                    # Normalise to UTC-aware — PostgreSQL may return naive datetimes
+                    # depending on driver configuration; naive - aware raises TypeError.
+                    started = interview.started_at
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
                     # Fall back: time since start capped at 3600 s
-                    elapsed = int((now - interview.started_at).total_seconds())
+                    elapsed = int((now - started).total_seconds())
                     duration = min(elapsed, 3600)
 
                 interview.status = "completed"

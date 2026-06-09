@@ -18,6 +18,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.security import create_report_token
 from app.db.session import AsyncSessionLocal
 from app.models.interview import (
     Interview, InterviewContext, InterviewTranscript,
@@ -560,7 +561,13 @@ async def _generate(db: AsyncSession, interview_id: str) -> bool:
         )
         db.add(report_row)
 
-    report_url = f"{settings.app_base_url}/api/v1/interviews/{interview_id}/report/html"
+    # Generate a signed token so the HTML report URL is access-controlled.
+    # Only holders of this signed link can view the recruiter report.
+    report_token = create_report_token(interview_id)
+    report_url = (
+        f"{settings.app_base_url}/api/v1/interviews/{interview_id}/report/html"
+        f"?token={report_token}"
+    )
 
     report_row.candidate_name = report_data["candidate_name"]
     report_row.position_title = report_data["position_title"]

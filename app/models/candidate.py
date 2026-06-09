@@ -1,4 +1,4 @@
-from sqlalchemy import String
+from sqlalchemy import String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -7,6 +7,11 @@ from app.models.base import BaseModel
 
 class Candidate(BaseModel):
     __tablename__ = "candidates"
+    __table_args__ = (
+        # Prevent duplicate candidates when ATS retries or replays a trigger.
+        # Scoped per tenant so two tenants can have the same ATS candidate ID.
+        UniqueConstraint("tenant_id", "ats_candidate_id", name="uq_candidates_tenant_ats_id"),
+    )
 
     # ID from the ATS system (not our UUID)
     ats_candidate_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
