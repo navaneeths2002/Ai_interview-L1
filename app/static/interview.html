@@ -1274,14 +1274,18 @@ async function startInterview() {
         videoEl.style.display = 'block';
         document.getElementById('plasma-canvas').style.display = 'none';
         console.log('[avatar] Simli video track live');
-      } else if (track.kind === LivekitClient.Track.Kind.Audio && !isSimliAvatar) {
-        // ── Agent audio — hook into waveform + plasma state ──────────────────
+      } else if (track.kind === LivekitClient.Track.Kind.Audio) {
+        // ── Play ALL audio tracks ────────────────────────────────────────────
+        // With the official Simli plugin, the AI voice is published by the
+        // 'simli-avatar' participant (audio + video). In voice-only mode it
+        // comes from the agent participant. Either way, play it so the
+        // candidate hears Sarah.
         const el = track.attach();
         el.style.display = 'none';
         document.body.appendChild(el);
         hookAI(el);
+        console.log('[audio] AI voice track playing from', participant.identity);
       }
-      // Simli audio is never published (video-only renderer) — no muting needed
     });
 
     room.on(LivekitClient.RoomEvent.TrackUnsubscribed, t => {

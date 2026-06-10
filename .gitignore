@@ -18,3 +18,4 @@ alembic/versions/*.py
 
 # Logs
 *.log
+ngrok.exe

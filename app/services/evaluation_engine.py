@@ -86,7 +86,7 @@ Scoring guidelines:
   jd_fit_score         — alignment with job requirements and critical skills (1=poor, 10=perfect)
   behavioral_score     — professionalism, stability signals, attitude (1=concerning, 10=exemplary)
   overall_score        — weighted composite:
-                          (jd_fit × 35) + (communication × 20) + (behavioral × 20)
+                          (jd_fit × 35) + (communication × 25) + (behavioral × 15)
                           + (confidence × 15) + ats_boost (0–10 based on ATS pre-score)
 
 Recommendation rules:
@@ -418,7 +418,25 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         logger.error(f"[eval] JSON parse failed for {interview_id}: {e}")
         return False
 
-    # ── 10. Save to DB ─────────────────────────────────────────────────────────
+    # ── 10. Override overall_score with exact formula ─────────────────────────
+    # Claude approximates the calculation. We recompute it precisely so the
+    # score is always mathematically correct regardless of Claude's rounding.
+    # Weights: JD Fit 35% | Communication 25% | Behavioral 15% | Confidence 15% | ATS 10%
+    try:
+        ats_boost = (ats.total_score / 100) * 10 if ats else 0
+        exact_score = round(
+            (result.get("jd_fit_score",        0) * 35 +
+             result.get("communication_score",  0) * 25 +
+             result.get("behavioral_score",     0) * 15 +
+             result.get("confidence_score",     0) * 15) / 10
+            + ats_boost
+        )
+        result["overall_score"] = max(0, min(100, exact_score))
+        logger.info(f"[eval] exact overall_score recalculated: {result['overall_score']}")
+    except Exception as e:
+        logger.warning(f"[eval] could not recalculate overall_score: {e}")
+
+    # ── 11. Save to DB ─────────────────────────────────────────────────────────
     await _save_results(db, interview, result)
 
     logger.info(

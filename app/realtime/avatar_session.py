@@ -170,18 +170,38 @@ class _VideoOnlyPublisher:
         logger.info("[avatar] video track published to room")
 
     async def render_loop(self) -> None:
-        """Pump video frames from Simli → LiveKit room.  Runs until Simli stops."""
+        """
+        Pump video frames from Simli → LiveKit room. Runs until Simli stops.
+
+        CRITICAL FIX: the numpy→bytes conversion (frame.to_ndarray().tobytes())
+        is CPU-heavy. Done on the event loop at 30fps it STARVES the agent's
+        audio-input processing, so the candidate's microphone audio never gets
+        processed (VAD never fires, "input speech hasn't started" forever).
+
+        We offload the heavy conversion to a thread pool and yield to the loop
+        after every frame, so audio frames are always processed in between.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _convert(f) -> tuple[int, int, bytes]:
+            # Runs in a worker thread — does NOT block the event loop.
+            return f.width, f.height, f.to_ndarray().tobytes()
+
         async for frame in self._client.getVideoStreamIterator("yuva420p"):
             if frame is None:
                 break
             try:
+                # Heavy CPU work offloaded to a thread → event loop stays free
+                width, height, data = await loop.run_in_executor(None, _convert, frame)
                 lk_frame = rtc.VideoFrame(
-                    frame.width,
-                    frame.height,
+                    width,
+                    height,
                     rtc.VideoBufferType.I420A,
-                    frame.to_ndarray().tobytes(),
+                    data,
                 )
                 self._video_src.capture_frame(lk_frame)
+                # Yield control so queued audio-input tasks run between frames
+                await asyncio.sleep(0)
             except Exception as e:
                 logger.debug(f"[avatar] frame error: {e}")
 

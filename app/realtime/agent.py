@@ -29,14 +29,13 @@ load_dotenv(dotenv_path=_env_path, override=False)
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.agents import llm
 from livekit.agents.voice import room_io
-from livekit.plugins import deepgram, elevenlabs, anthropic, silero
+from livekit.plugins import deepgram, elevenlabs, anthropic, silero, simli
 from livekit.plugins.elevenlabs import VoiceSettings
 from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.realtime.interview_graph import build_interview_graph, make_initial_state, InterviewState
-from app.realtime.avatar_session import AvatarSession
 
 
 # ── Base system prompt ─────────────────────────────────────────────────────────
@@ -525,7 +524,6 @@ async def entrypoint(ctx: JobContext):
     )
 
     interview_start_time: list[datetime | None] = [None]
-    _avatar_holder: list[AvatarSession]          = []
 
     # ── FIX 4: Create hr_agent BEFORE on_shutdown ─────────────────────────────
     # Previously hr_agent was created AFTER on_shutdown was defined and
@@ -573,9 +571,6 @@ async def entrypoint(ctx: JobContext):
                     "Post-interview evaluation failed",
                     extra={"interview_id": interview_id, "error": str(e)},
                 )
-
-        if _avatar_holder:
-            await _avatar_holder[0].stop()
 
     ctx.add_shutdown_callback(on_shutdown)
 
@@ -690,13 +685,57 @@ async def entrypoint(ctx: JobContext):
         min_interruption_words=4,
         min_endpointing_delay=0.4,
         max_endpointing_delay=6.0,
+        aec_warmup_duration=0,
     )
+
+    # ── Avatar via OFFICIAL livekit-plugins-simli (must start BEFORE session) ──
+    # The official plugin dispatches the avatar as a SEPARATE LiveKit worker that
+    # renders video + republishes audio. It does NOT run on this event loop, so
+    # it cannot starve the candidate-audio pipeline (the root cause of the
+    # custom-forwarder approach failing). When active, the avatar publishes the
+    # agent's voice itself — so we disable the room's own audio output to avoid
+    # double audio.
+    simli_api_key = os.environ.get("SIMLI_API_KEY", "")
+    simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
+    avatar_active = False
+
+    if simli_api_key and simli_face_id:
+        try:
+            avatar = simli.AvatarSession(
+                simli_config=simli.SimliConfig(
+                    api_key=simli_api_key,
+                    face_id=simli_face_id,
+                ),
+                avatar_participant_identity="simli-avatar",
+                avatar_participant_name="Sarah",
+            )
+            await avatar.start(
+                session,
+                room=ctx.room,
+                livekit_url=os.environ.get("LIVEKIT_URL", ""),
+                livekit_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
+                livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
+            )
+            avatar_active = True
+            logger.info("Simli avatar active (official plugin)", extra={"interview_id": interview_id})
+        except Exception as e:
+            logger.warning(
+                f"Simli avatar failed to start — falling back to voice-only: {e}",
+                extra={"interview_id": interview_id},
+            )
+            avatar_active = False
+    else:
+        logger.info("Simli keys not set — voice-only mode", extra={"interview_id": interview_id})
 
     await session.start(
         room=ctx.room,
         agent=hr_agent,
         room_options=room_io.RoomOptions(
-            audio_input=True,   # enable with all defaults — simplest and most reliable
+            # auto_gain_control=False disables the per-frame APM native call.
+            audio_input=room_io.AudioInputOptions(auto_gain_control=False),
+            # When avatar is active it republishes the audio itself → disable
+            # the room's direct audio output to prevent double audio.
+            audio_output=(not avatar_active),
         ),
     )
 
@@ -750,47 +789,6 @@ async def entrypoint(ctx: JobContext):
                 "data_received error",
                 extra={"interview_id": interview_id, "error": str(e)},
             )
-
-    # ── Avatar (optional) ─────────────────────────────────────────────────────
-    avatar = AvatarSession()
-    _avatar_holder.append(avatar)
-
-    simli_api_key = os.environ.get("SIMLI_API_KEY", "")
-    simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
-
-    simli_forwarder = None
-    if simli_api_key and simli_face_id:
-        try:
-            simli_forwarder = await asyncio.wait_for(
-                avatar.start(
-                    room_name=room_name,
-                    lk_url=os.environ.get("LIVEKIT_URL", ""),
-                    lk_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
-                    lk_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
-                    simli_api_key=simli_api_key,
-                    simli_face_id=simli_face_id,
-                    current_audio_output=session.output.audio,
-                ),
-                timeout=8.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Simli timed out — falling back to voice-only",
-                extra={"interview_id": interview_id},
-            )
-            await avatar.stop()
-            simli_forwarder = None
-    else:
-        logger.info(
-            "Simli keys not set — voice-only mode",
-            extra={"interview_id": interview_id},
-        )
-
-    if simli_forwarder is not None:
-        session.output.audio = simli_forwarder
-        logger.info("Simli avatar active", extra={"interview_id": interview_id})
-    else:
-        logger.info("Voice-only mode", extra={"interview_id": interview_id})
 
     await session.generate_reply(
         instructions=(
