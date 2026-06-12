@@ -36,6 +36,7 @@ from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.realtime.interview_graph import build_interview_graph, make_initial_state, InterviewState
+from app.realtime import crash_recovery
 
 
 # ── Base system prompt ─────────────────────────────────────────────────────────
@@ -429,6 +430,8 @@ class HRInterviewAgent(Agent):
             )
             self._graph_state = new_state
             self._log_stage()
+            # CRASH RECOVERY HOOK: persist stage so a crash can resume here
+            crash_recovery.queue_save_stage(self.interview_id, self._graph_state)
         except Exception as e:
             logger.error(
                 "LangGraph advance error",
@@ -461,6 +464,8 @@ class HRInterviewAgent(Agent):
             )
             self._graph_state = new_state
             self._log_stage()
+            # CRASH RECOVERY HOOK: persist stage so a crash can resume here
+            crash_recovery.queue_save_stage(self.interview_id, self._graph_state)
         except Exception as e:
             logger.error(
                 "LangGraph advance error (typed)",
@@ -518,12 +523,30 @@ async def entrypoint(ctx: JobContext):
         skills_to_probe=skills_to_probe,
         gaps_to_probe=gaps_to_probe,
     )
+
+    # ── CRASH RECOVERY HOOK: resume from saved stage if agent crashed mid-interview
+    resume_state = None
+    if interview_id:
+        resume_state = await crash_recovery.load_resume_state(interview_id)
+        if resume_state:
+            graph_state = crash_recovery.apply_resume(graph_state, resume_state)
+
     logger.info(
         "LangGraph initialised",
-        extra={"stage": "intro", "candidate": candidate_name, "interview_id": interview_id},
+        extra={
+            "stage": graph_state.get("stage", "intro"),
+            "resumed": bool(resume_state),
+            "candidate": candidate_name,
+            "interview_id": interview_id,
+        },
     )
 
     interview_start_time: list[datetime | None] = [None]
+    # Holder so reconnect handler (registered before session exists) can reach it
+    _session_holder: list = []
+    # Strong refs to fire-and-forget tasks — an unreferenced asyncio task can be
+    # garbage-collected before it runs (e.g. the re-greet vanishing mid-sleep)
+    _pending_tasks: set[asyncio.Task] = set()
 
     # ── FIX 4: Create hr_agent BEFORE on_shutdown ─────────────────────────────
     # Previously hr_agent was created AFTER on_shutdown was defined and
@@ -603,7 +626,22 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.warning(f"[audio] set_subscribed failed: {e}")
 
-    # ── Mark in_progress when candidate joins ─────────────────────────────────
+    # ── CRASH RECOVERY: 60s grace period instead of instant shutdown ──────────
+    # A page reload looks like a disconnect. Previously the agent shut down
+    # immediately, killing the interview. Now finalization is delayed 60s —
+    # if the candidate reconnects in time, the interview simply continues.
+    async def _finalize_after_grace() -> None:
+        result = ctx.shutdown()
+        if asyncio.iscoroutine(result):
+            await result
+
+    grace_timer = crash_recovery.DisconnectGraceTimer(
+        on_expired=_finalize_after_grace,
+        grace_seconds=60.0,
+        interview_id=interview_id,
+    )
+
+    # ── Mark in_progress when candidate joins (+ re-greet on reconnect) ───────
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant) -> None:
         if not interview_id or not tenant_id:
@@ -613,23 +651,63 @@ async def entrypoint(ctx: JobContext):
         if not participant.identity.startswith("candidate-"):
             return
 
-        interview_start_time[0] = datetime.now(timezone.utc)
+        # CRASH RECOVERY HOOK: was this a reconnect within the grace period?
+        is_reconnect = grace_timer.candidate_returned()
+
+        # Only set the start time on the FIRST join — a reconnect must not
+        # overwrite it (would corrupt the duration calculation).
+        if interview_start_time[0] is None:
+            interview_start_time[0] = datetime.now(timezone.utc)
+            status_task = asyncio.create_task(
+                _update_interview_status(
+                    interview_id, "in_progress",
+                    started_at=interview_start_time[0],
+                )
+            )
+            _pending_tasks.add(status_task)
+            status_task.add_done_callback(_pending_tasks.discard)
+
         logger.info(
-            "Candidate joined room",
+            "Candidate joined room" + (" (RECONNECT)" if is_reconnect else ""),
             extra={"identity": participant.identity, "interview_id": interview_id},
         )
-        asyncio.create_task(
-            _update_interview_status(
-                interview_id, "in_progress",
-                started_at=interview_start_time[0],
-            )
-        )
 
-    # ── Shut down agent when candidate leaves ──────────────────────────────────
-    # When the candidate clicks "End Interview" or closes the browser tab,
-    # room.disconnect() fires on their side. Without this handler the agent
-    # stays in the room indefinitely and on_shutdown never fires — the
-    # interview stays stuck in "in_progress" forever.
+        # Sarah re-greets: "Welcome back…" and re-asks the current question.
+        # generate_reply() is SYNC (returns a SpeechHandle) — do not wrap the
+        # call itself in create_task. Small delay lets the browser re-attach
+        # the audio track before Sarah starts speaking.
+        # The task reference MUST be held (_pending_tasks) — an unreferenced
+        # asyncio task can be garbage-collected mid-sleep and silently vanish.
+        stage = hr_agent._graph_state.get("stage", "intro")
+        if is_reconnect and _session_holder and stage not in ("complete", "wrap_up"):
+
+            async def _regreet() -> None:
+                await asyncio.sleep(1.0)
+                logger.info(
+                    f"[crash-recovery] re-greeting candidate (stage={stage})",
+                    extra={"interview_id": interview_id},
+                )
+                try:
+                    handle = _session_holder[0].generate_reply(
+                        instructions=crash_recovery.resume_greeting_instructions(
+                            candidate_name, stage
+                        )
+                    )
+                    logger.info(
+                        f"[crash-recovery] re-greet speech scheduled (handle={handle.id})",
+                        extra={"interview_id": interview_id},
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[crash-recovery] re-greet failed (interview continues): {e}",
+                        extra={"interview_id": interview_id},
+                    )
+
+            task = asyncio.create_task(_regreet(), name="crash-recovery-regreet")
+            _pending_tasks.add(task)
+            task.add_done_callback(_pending_tasks.discard)
+
+    # ── Candidate leaves → start grace countdown (NOT instant shutdown) ───────
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant) -> None:
         # Only react to the candidate leaving — ignore avatar/other agents
@@ -638,15 +716,10 @@ async def entrypoint(ctx: JobContext):
         if not participant.identity.startswith("candidate-"):
             return
 
-        logger.info(
-            "Candidate left room — shutting down agent job",
-            extra={"identity": participant.identity, "interview_id": interview_id},
-        )
-        # ctx.shutdown() triggers on_shutdown callback which:
-        # 1. Marks interview as completed
-        # 2. Drains transcript saves
-        # 3. Runs evaluation + report generation
-        asyncio.create_task(ctx.shutdown())
+        # CRASH RECOVERY HOOK: don't finalize yet — give them 60s to return.
+        # If they don't come back, _finalize_after_grace() runs ctx.shutdown(),
+        # which marks completed, drains transcripts, and runs evaluation.
+        grace_timer.candidate_left()
 
     # ── AgentSession ──────────────────────────────────────────────────────────
     session = AgentSession(
@@ -687,6 +760,8 @@ async def entrypoint(ctx: JobContext):
         max_endpointing_delay=6.0,
         aec_warmup_duration=0,
     )
+    # CRASH RECOVERY HOOK: let the reconnect handler reach the session for re-greeting
+    _session_holder.append(session)
 
     # ── Avatar via OFFICIAL livekit-plugins-simli (must start BEFORE session) ──
     # The official plugin dispatches the avatar as a SEPARATE LiveKit worker that
@@ -695,11 +770,19 @@ async def entrypoint(ctx: JobContext):
     # custom-forwarder approach failing). When active, the avatar publishes the
     # agent's voice itself — so we disable the room's own audio output to avoid
     # double audio.
+    # AVATAR_ENABLED=false → run voice-only (room publishes audio directly).
+    # This is the RELIABLE mode on unstable networks: when the avatar is active
+    # all voice is routed through the Simli worker, so a network blip that kills
+    # the agent→avatar audio pipe leaves the candidate with text but NO voice.
+    # Voice-only has no such single point of failure.
+    avatar_enabled = os.environ.get("AVATAR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
     simli_api_key = os.environ.get("SIMLI_API_KEY", "")
     simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
     avatar_active = False
 
-    if simli_api_key and simli_face_id:
+    if not avatar_enabled:
+        logger.info("AVATAR_ENABLED=false — voice-only mode (reliable)", extra={"interview_id": interview_id})
+    elif simli_api_key and simli_face_id:
         try:
             avatar = simli.AvatarSession(
                 simli_config=simli.SimliConfig(
@@ -736,6 +819,11 @@ async def entrypoint(ctx: JobContext):
             # When avatar is active it republishes the audio itself → disable
             # the room's direct audio output to prevent double audio.
             audio_output=(not avatar_active),
+            # CRASH RECOVERY: the SDK default (True) closes the AgentSession the
+            # instant the candidate disconnects — which kills the session before
+            # the 60s grace timer can do its job ("AgentSession isn't running"
+            # on reconnect). The grace timer owns finalization via ctx.shutdown().
+            close_on_disconnect=False,
         ),
     )
 
@@ -790,14 +878,22 @@ async def entrypoint(ctx: JobContext):
                 extra={"interview_id": interview_id, "error": str(e)},
             )
 
-    await session.generate_reply(
-        instructions=(
+    # CRASH RECOVERY HOOK: if this agent job is resuming a crashed interview,
+    # Sarah says "Welcome back…" and re-asks the current stage's question
+    # instead of restarting the interview from the introduction.
+    if resume_state:
+        greeting = crash_recovery.resume_greeting_instructions(
+            candidate_name, graph_state.get("stage", "intro")
+        )
+    else:
+        greeting = (
             "Greet the candidate warmly. Welcome them to their screening interview. "
             f"Their name is {candidate_name}. "
             "Mention that the session will be recorded and ask for their consent to proceed. "
             "Be natural and friendly — like a real HR person starting a call."
         )
-    )
+
+    await session.generate_reply(instructions=greeting)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 **Author:** Navaneeth S (aimlteam@interbiz.in)
 **Type:** SaaS HRMS microservice
 **Stack:** Python 3.12 · FastAPI · PostgreSQL · LiveKit · Deepgram · ElevenLabs · Anthropic Claude · Simli
-**Status:** Phases 1–9 complete + Signed Invite Token auth live
+**Status:** Phases 1–11 complete — invite-token auth, official Simli avatar plugin, weighted evaluation, in-interview crash recovery all live
 
 ---
 
@@ -69,7 +69,8 @@ interview-agent/
 │   │   ├── room_manager.py            # LiveKit room creation + token generation
 │   │   ├── agent.py                   # Voice agent worker (separate process)
 │   │   ├── interview_graph.py         # LangGraph state machine (9 stages)
-│   │   └── avatar_session.py          # Simli avatar — audio forwarder + video publisher
+│   │   ├── crash_recovery.py          # Phase 11 — grace timer, stage persistence, resume
+│   │   └── avatar_session.py          # LEGACY custom Simli bridge (unused — official plugin now)
 │   ├── db/
 │   │   └── session.py                 # Async SQLAlchemy engine + get_db dependency
 │   └── static/
@@ -193,33 +194,39 @@ Candidate clicks secure join link (email)
     → Agent greets candidate
     ↓
 Candidate speaks
-    → Silero VAD detects speech
-    → Deepgram STT (nova-3, en-IN) transcribes
+    → Silero VAD detects speech (activation_threshold=0.1, very sensitive)
+    → Deepgram STT (nova-2-general, language "en", endpointing 200ms) transcribes
     → HRInterviewAgent.on_user_turn_completed() fires
-        → Mishear guard (1 unclear word → "Could you say that again?")
+        → Mishear guard (empty text only → "Could you say that again?")
         → Save candidate message to DB (fire-and-forget)
         → LangGraph.ainvoke() — advance stage machine
+        → crash_recovery.queue_save_stage() — persist stage to DB (Phase 11)
         → Pre-response delay 300–600ms
         → 20% chance filler word ("Hmm.", "Right.", etc.)
     → Claude Haiku generates response (stage-aware system prompt)
-    → Save AI response to DB
+    → AI response captured via session "conversation_item_added" event → saved to DB
     → ElevenLabs TTS (Sarah voice, turbo) synthesises audio
-        → SimliAudioForwarder intercepts PCM frames:
-            ├── Resamples to 16 kHz mono → sends to Simli (lip sync)
-            └── Forwards to room audio output → candidate hears voice
-    → Simli renders face animation → publishes video to room
-    → Candidate sees animated face + hears voice (no double audio)
+    → Official Simli plugin (livekit-plugins-simli) runs the avatar as a
+      SEPARATE LiveKit worker — it republishes the agent's voice + lip-synced
+      face video as the "simli-avatar" participant (room's own audio output is
+      disabled when avatar is active → no double audio)
+    → Candidate sees animated face + hears voice
     → Repeat until wrap_up stage completes
     ↓
-Interview ends (candidate leaves / wrap_up complete)
-    → on_shutdown: status → "completed", duration saved
-    → asyncio.create_task(run_evaluation(interview_id))      ← Phase 6
+Candidate disconnects (reload / network blip / leaves)
+    → DisconnectGraceTimer starts 60s countdown (Phase 11)
+    → Reconnects in time → Sarah re-greets "Welcome back…" and continues the stage
+    → Doesn't return → ctx.shutdown() fires the normal completion path
+    ↓
+Interview ends
+    → on_shutdown: status → "completed", duration saved, transcript tasks drained
+    → run_evaluation(interview_id)                           ← Phase 6
     → run_evaluation saves scores to InterviewScore table
-    → asyncio.create_task(run_report(interview_id))          ← Phase 7
+    → chains into run_report(interview_id)                   ← Phase 7
     → run_report saves HTML + JSON to InterviewReport table
 ```
 
-Barge-in: candidate can interrupt AI with 2+ words and it stops immediately.
+Barge-in: candidate can interrupt AI with 4+ words (`min_interruption_words=4`) and it stops immediately.
 
 ---
 
@@ -236,14 +243,27 @@ Max 3 turns per stage before force-advancing.
 
 ---
 
-## Avatar (Simli)
+## Avatar (Simli — Official Plugin)
 
-**File:** `app/realtime/avatar_session.py`
+**Package:** `livekit-plugins-simli==1.5.11` (used in `agent.py`)
 
-Architecture:
-- `SimliAudioForwarder` — custom `livekit.agents.io.AudioOutput` inserted into the audio chain after `session.start()`. Intercepts every PCM frame: resamples to 16 kHz mono, sends 6 kB chunks to Simli, and also calls `next_in_chain` so room audio continues normally.
-- `_VideoOnlyPublisher` — connects to the interview LiveKit room as `simli-avatar` participant, publishes only a video track (no audio = no double audio). Pumps `yuva420p` frames from SimliClient directly into `rtc.VideoSource`.
-- `AvatarSession` — lifecycle manager. Returns a `SimliAudioForwarder` that replaces `session.output.audio`. Stops cleanly in `on_shutdown`.
+The avatar uses the **official LiveKit Simli plugin**, started BEFORE `session.start()`:
+
+```python
+avatar = simli.AvatarSession(
+    simli_config=simli.SimliConfig(api_key=..., face_id=...),
+    avatar_participant_identity="simli-avatar",
+    avatar_participant_name="Sarah",
+)
+await avatar.start(session, room=ctx.room, livekit_url=..., livekit_api_key=..., livekit_api_secret=...)
+```
+
+How it works:
+- The plugin dispatches the avatar as a **separate LiveKit worker** — rendering does NOT run on the agent's event loop, so it can never starve candidate-audio processing (the root failure of the old custom approach).
+- The avatar participant (`simli-avatar`) publishes BOTH the lip-synced face video AND the agent's voice audio. The room's own audio output is therefore disabled when the avatar is active: `room_io.RoomOptions(audio_output=(not avatar_active))` — this prevents double audio.
+- The browser (`interview.html`) plays ALL audio tracks (including from `simli-avatar`).
+
+**History:** `app/realtime/avatar_session.py` is the old custom implementation (SimliAudioForwarder + _VideoOnlyPublisher). Its in-process 30fps video rendering starved the event loop and broke mic input. The file is kept for reference but is **no longer imported by agent.py**.
 
 **Required env vars:**
 ```env
@@ -251,7 +271,7 @@ SIMLI_API_KEY=...
 SIMLI_FACE_ID=...   # Upload HR persona photo at simli.com → get face_id
 ```
 
-If keys are missing, avatar is disabled silently — interview continues voice-only.
+If keys are missing or `avatar.start()` fails, avatar is disabled silently — interview continues voice-only (room audio output re-enabled).
 
 ---
 
@@ -260,9 +280,25 @@ If keys are missing, avatar is disabled silently — interview continues voice-o
 **File:** `app/services/evaluation_engine.py`
 
 - Model: `claude-haiku-4-5-20251001`
-- Triggered automatically in `on_shutdown` via `asyncio.create_task`
+- Triggered automatically in `on_shutdown` (after transcript tasks drained)
 - Loads full transcript + candidate profile + job + ATS from DB
-- Returns structured JSON scores: `communication`, `confidence`, `jd_fit`, `behavioral`, `overall` (0–10), `recommendation` (proceed_to_l2 / hold / reject)
+- Claude returns per-dimension scores (1–10): `communication`, `confidence`, `jd_fit`, `behavioral` + `recommendation` (proceed_to_l2 / hold / reject)
+- **Overall score (0–100) is computed exactly in code** (not by Claude) with these weights:
+
+| Dimension | Weight |
+|---|---|
+| JD Fit | 35% |
+| Communication | 25% |
+| Behavioral | 15% |
+| Confidence | 15% |
+| ATS Boost | 10% |
+
+```python
+overall = (jd_fit*35 + communication*25 + behavioral*15 + confidence*15) / 10
+        + (ats_score / 100) * 10        # ATS boost, capped at 10 points
+overall = max(0, min(100, round(overall)))
+```
+
 - Saves to `InterviewScore` and `InterviewExtractedData` tables
 - After saving, chains into `run_report(interview_id)`
 
@@ -287,11 +323,13 @@ Headers: X-Tenant-ID: tenant-001
 - No extra Claude call — reuses `raw_extraction` JSONB from `InterviewExtractedData`
 - Generates self-contained HTML report (all CSS inline, no external dependencies)
 - Saves to `InterviewReport` table: `report_html`, `report_data` (JSONB), `report_url`, `generated_at`
-- `report_url` = `{APP_BASE_URL}/api/v1/interviews/{id}/report/html`
+- `report_url` = `{APP_BASE_URL}/api/v1/interviews/{id}/report/html?token=<signed report token>`
 
-**View HTML report (browser — no auth header needed):**
+**Report access token:** the HTML report URL requires a signed JWT (`type: report`, 7-day expiry — `create_report_token()` / `verify_report_token()` in `app/core/security.py`). The token is embedded in `report_url` when the report is generated. Opening the URL without/with an invalid token → 401/403.
+
+**View HTML report (browser — use the full `report_url` from the JSON report):**
 ```
-GET http://localhost:8000/api/v1/interviews/{id}/report/html
+GET http://localhost:8000/api/v1/interviews/{id}/report/html?token=eyJhbGci...
 ```
 Click **Save as PDF** button → browser print dialog → Save as PDF.
 
@@ -303,7 +341,7 @@ Headers: X-Tenant-ID: tenant-001
 
 ---
 
-## Crash Recovery (Phase 8)
+## Workflow Recovery (Phase 8)
 
 **Files:** `app/services/recovery.py` + `app/workers/scheduler.py`
 
@@ -321,6 +359,40 @@ Four recovery functions run on startup and periodically via APScheduler:
 GET  /api/v1/admin/recovery/status   Headers: X-Tenant-ID: tenant-001
 POST /api/v1/admin/recovery/run      Headers: X-Tenant-ID: tenant-001
 ```
+
+---
+
+## In-Interview Crash Recovery (Phase 11)
+
+**File:** `app/realtime/crash_recovery.py` — fully self-contained unit (own DB engine, pool_size=2). The agent only calls thin marked hooks; no pipeline internals were touched.
+
+Three capabilities:
+
+**1. Disconnect grace period (60s)** — `DisconnectGraceTimer`
+A page reload or network blip looks like a disconnect. Instead of finalizing instantly, a 60-second countdown starts. If the candidate reconnects in time, the countdown is cancelled and the interview continues. If not, `ctx.shutdown()` runs the normal completion path (status → completed, evaluation, report).
+**Requires `close_on_disconnect=False` in `room_io.RoomOptions`** — the SDK default (True) closes the AgentSession the instant the candidate disconnects, which breaks the grace timer (`RuntimeError: AgentSession isn't running` on reconnect). Re-linking is automatic because the candidate rejoins with the same identity.
+
+**2. Stage persistence** — `queue_save_stage()` / `load_resume_state()`
+After every LangGraph advance (voice and typed), the current stage + turn count + capture flags are saved fire-and-forget to `interview_contexts.question_flow` (existing JSONB column — no migration). If the agent process crashes, the stage survives in the DB.
+
+**3. Resume on a fresh agent job** — `apply_resume()` + `resume_greeting_instructions()`
+When a new agent job starts for an interview that is still `in_progress` with a saved stage (not intro/complete), the LangGraph state is restored to that stage and Sarah re-greets: *"Welcome back, {name}! … we'll continue right where we left off"* — then re-asks the current stage's question instead of restarting from the introduction.
+
+```
+Candidate reloads page
+    → participant_disconnected → grace_timer.candidate_left() (60s countdown)
+    → participant_connected → grace_timer.candidate_returned() == True
+    → Sarah: "Welcome back…" + re-asks current stage question
+    → interview continues, start time / duration NOT corrupted
+
+Agent worker crashes mid-interview
+    → LiveKit dispatches a fresh job when candidate (re)joins
+    → load_resume_state() finds saved stage in question_flow
+    → apply_resume() restores stage + captured flags + stage_instruction
+    → greeting = "Welcome back…" instead of fresh intro
+```
+
+**Known tradeoff:** clicking "End Interview" also looks like a disconnect, so evaluation starts ~60s after the candidate leaves (grace period must expire first).
 
 ---
 
@@ -354,6 +426,7 @@ LIVEKIT_API_SECRET=...
 # Simli Avatar
 SIMLI_API_KEY=...
 SIMLI_FACE_ID=...
+AVATAR_ENABLED=true   # set false → reliable voice-only mode (no avatar single-point-of-failure)
 
 # AWS (S3)
 AWS_ACCESS_KEY_ID=...
@@ -407,7 +480,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 - `/health`, `/docs`, `/openapi.json`, `/redoc`
 - `/interview/*`, `/static/*`
 - `/api/v1/interviews/{id}/token`  ← uses signed invite token instead
-- `/api/v1/interviews/{id}/report/html`  ← browser-opened URL, no headers possible
+- `/api/v1/interviews/{id}/report/html`  ← uses signed report token (?token=) instead of headers
 
 ---
 
@@ -420,7 +493,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | GET | `/api/v1/interviews/{id}/evaluation` | X-Tenant-ID | Get evaluation scores |
 | POST | `/api/v1/interviews/{id}/evaluate` | X-Tenant-ID | Manually trigger evaluation |
 | GET | `/api/v1/interviews/{id}/report` | X-Tenant-ID | Get JSON report |
-| GET | `/api/v1/interviews/{id}/report/html` | None | View HTML report in browser |
+| GET | `/api/v1/interviews/{id}/report/html` | Signed report token (?token=) | View HTML report in browser |
 | POST | `/api/v1/interviews/{id}/report` | X-Tenant-ID | Trigger/regenerate report |
 | GET | `/api/v1/admin/recovery/status` | X-Tenant-ID | Recovery health check |
 | POST | `/api/v1/admin/recovery/run` | X-Tenant-ID | Manually trigger recovery |
@@ -443,6 +516,10 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 8 | ✅ Done | Workflow durability + crash recovery (APScheduler + 4 recovery jobs) |
 | 9 | ✅ Done | Hardening — rate limiting, structured logging, systemd + EC2 scripts |
 | 10 | ✅ Done | Signed invite token — secure candidate join link + auto email invite |
+| 10.5 | ✅ Done | Official Simli plugin (livekit-plugins-simli) — avatar as separate worker, mic + avatar coexist |
+| 10.6 | ✅ Done | Weighted evaluation — JD Fit 35 / Comm 25 / Behav 15 / Conf 15 / ATS 10, exact in-code calculation |
+| 10.7 | ✅ Done | Signed report token — HTML report URL requires ?token= (7-day expiry) |
+| 11 | ✅ Done | In-interview crash recovery — 60s grace timer, stage persistence, "Welcome back" resume |
 
 ---
 
@@ -460,10 +537,15 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 
 ## Known Constraints
 
-- **Corporate WiFi:** WebRTC UDP is blocked on most office networks. The interview page forces `iceTransportPolicy: "relay"` to use LiveKit's TURN servers over TCP/443.
+- **Corporate WiFi:** WebRTC UDP is blocked on most office networks. The interview page forces `iceTransportPolicy: "relay"` to use LiveKit's TURN servers over TCP/443. Whitelist `*.livekit.cloud` (TCP 443) with IT if needed.
 - **Claude overload:** `claude-haiku-4-5-20251001` occasionally returns 529. The agent framework retries automatically.
 - **Two processes required:** FastAPI server + agent worker must both be running.
-- **Simli is optional:** If `SIMLI_API_KEY` or `SIMLI_FACE_ID` is missing, avatar is silently disabled — voice-only mode.
-- **Audio model on account:** Only `claude-haiku-4-5-20251001` confirmed available. `claude-3-5-sonnet` and `claude-sonnet-4-5-20251001` are NOT on this account.
-- **Room max_participants = 3:** Agent + candidate + simli-avatar. Do not lower this.
+- **Simli is optional:** If `SIMLI_API_KEY` or `SIMLI_FACE_ID` is missing (or `avatar.start()` fails), avatar is silently disabled — voice-only mode with room audio output re-enabled.
+- **Avatar must use the official plugin:** `livekit-plugins-simli`. The custom in-process bridge (`avatar_session.py`) starved the event loop and broke mic input — do not revert to it.
+- **Avatar is a voice single-point-of-failure:** when active, ALL of Sarah's audio is routed through the Simli worker (`audio_output=(not avatar_active)`). If a network blip kills the agent→avatar audio pipe (`_audio_forwarding_task` crashes with `publisher connection timeout`), the avatar freezes and the candidate gets text but NO voice — there is no fallback to room audio mid-session. On unstable networks set `AVATAR_ENABLED=false` for reliable voice-only operation.
+- **Model on account:** Only `claude-haiku-4-5-20251001` confirmed available. `claude-3-5-sonnet` and `claude-sonnet-4-5-20251001` are NOT on this account.
+- **Room max_participants = 3:** Agent + candidate + simli-avatar. Do not lower this. `empty_timeout=30s`.
 - **Email is optional:** If SMTP not configured, invite email is skipped — join_url is still returned in the trigger response and can be shared manually.
+- **End Interview waits 60s:** the disconnect grace timer (Phase 11) cannot distinguish "End Interview" from a reload, so completion/evaluation starts ~60s after the candidate leaves.
+- **JSONB writes from the agent:** always bind with `bindparam("x", type_=PG_JSONB)` and pass Python lists/dicts. Never use `::jsonb` casts in `text()` SQL — asyncpg + SQLAlchemy named params break on it.
+- **AI transcript turns:** must be captured via `session.on("conversation_item_added")` — `turn_ctx` in `on_user_turn_completed` is a temporary copy and never contains the assistant reply.

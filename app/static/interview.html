@@ -584,6 +584,7 @@ const interviewId  = location.pathname.split('/').filter(Boolean).pop();
 const inviteToken  = new URLSearchParams(location.search).get('token') || '';
 let room = null;
 let cachedTokenData = null; // prefetched on load, reused on Start
+let endedByUser = false;    // true only when candidate clicks End Interview
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const html = document.documentElement;
@@ -1255,13 +1256,40 @@ async function startInterview() {
       setAvatarMode('thinking');
     });
 
-    room.on(LivekitClient.RoomEvent.Disconnected, () => {
+    // ── Transient network drop — LiveKit is auto-reconnecting ────────────────
+    // Do NOT tear down the session here. The agent holds a 60s grace window,
+    // so a brief WiFi blip should just show "Reconnecting…" and recover.
+    room.on(LivekitClient.RoomEvent.Reconnecting, () => {
+      setConnLabel('Reconnecting…');
+      setAvatarMode('thinking');
+      addMsg('sys', 'Connection unstable — reconnecting…');
+    });
+
+    room.on(LivekitClient.RoomEvent.Reconnected, () => {
+      setConnLabel('Online');
+      setAvatarMode('idle');
+      addMsg('sys', 'Reconnected. The interview continues.');
+    });
+
+    // ── Full disconnect ──────────────────────────────────────────────────────
+    // Only treat as "over" when WE ended it (manual End Interview) or the room
+    // was closed by the server. A reload starts a fresh page that re-joins, so
+    // this handler must NOT show the done screen on every disconnect.
+    room.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
       stopTimer();
       setConnLabel('Disconnected');
       document.getElementById('endBtn').disabled = true;
       setAvatarMode('idle');
-      allDone();
-      document.getElementById('done-scr').classList.add('show');
+      // CLIENT_INITIATED = candidate clicked End Interview → show done screen.
+      // Any other reason (signal lost, etc.) leaves the page as-is so the
+      // candidate can simply refresh to rejoin within the grace window.
+      const R = LivekitClient.DisconnectReason || {};
+      if (reason === R.CLIENT_INITIATED || endedByUser) {
+        allDone();
+        document.getElementById('done-scr').classList.add('show');
+      } else {
+        addMsg('sys', '⚠ Connection lost. Refresh this page to rejoin — your interview is held for 60 seconds.');
+      }
     });
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
@@ -1331,6 +1359,7 @@ async function startInterview() {
 }
 
 async function endInterview() {
+  endedByUser = true;
   if (room) { await room.disconnect(); room = null; }
   stopTimer();
   setConnLabel('Ended');

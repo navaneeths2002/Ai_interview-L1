@@ -97,11 +97,11 @@ Three participants join every room: the agent worker, the candidate browser, and
 **Why Deepgram and not OpenAI Whisper?**
 OpenAI Whisper is batch-only — no real-time streaming. A 1–3 second STT delay makes conversation feel broken. Deepgram streams partial transcripts as the candidate speaks.
 
-**Why `nova-3` with `en-IN`?**
-Latest Deepgram model, best accuracy. `en-IN` language code provides Indian English accent optimisation.
+**Why `nova-2-general` with language `"en"`?**
+Originally `nova-3` + `en-IN` was used. During mic-detection debugging it was switched to `nova-2-general` with the broader `"en"` language code — wider detection envelope, fewer dropped utterances. This is the current production setting in `agent.py`.
 
-**Why `endpointing_ms=300`?**
-Default 25ms cuts off candidates who pause briefly to think. 300ms is a comfortable natural pause.
+**Why `endpointing_ms=200`?**
+Default 25ms cuts off candidates who pause briefly to think. Originally 300ms; reduced to 200ms for faster turn response while still allowing natural pauses.
 
 **Why `interim_results=True`?**
 Deepgram sends partial transcripts while candidate is still speaking. The livekit-agents framework uses these to start preemptive LLM generation — reduces perceived response latency.
@@ -163,11 +163,17 @@ Humans don't respond in 0ms. An instant response feels robotic. Also prevents pr
 **Why 20% filler probability?**
 At higher rates, fillers become a predictable pattern — candidates notice. At 20% (~every 5 turns), they feel natural.
 
-**Why `min_interruption_words=2`?**
-Single coughs, "yeah", or background noise shouldn't stop the AI mid-sentence.
+**Why `min_interruption_words=4`?**
+Single coughs, "yeah", or background noise shouldn't stop the AI mid-sentence. Raised from 2 to 4 after testing — short acknowledgments ("okay", "I see") were falsely interrupting Sarah.
 
-**Why capture AI messages via `turn_ctx.messages[ctx_len_before:]`?**
-In livekit-agents 1.x, `on_user_turn_completed`'s `turn_ctx` is mutated in-place during the super() call. The assistant message is appended after LLM generation. Capturing `messages[ctx_len_before:]` gets all new messages added during the super() call, from which we extract the assistant turn for transcript saving.
+**Why the mishear guard only fires on EMPTY text?**
+The original guard rejected anything ≤1 word — which discarded valid short answers like "yes", "no", "okay". Now only truly empty transcripts trigger "Could you say that again?".
+
+**Why AI messages are captured via `session.on("conversation_item_added")` — NOT `turn_ctx`?**
+In livekit-agents 1.x, `on_user_turn_completed`'s `turn_ctx` is a **temporary copy** (`chat_ctx.copy()`) made before the LLM call. The assistant reply is written to the agent's REAL chat context, never to the copy — so reading `turn_ctx` after `super()` always returned nothing and AI turns were silently never saved. The fix: listen to the session-level `conversation_item_added` event, filter for `"assistant"` in the item role, and queue the transcript save there. This was one of the hardest-to-find bugs in the project.
+
+**Why VAD `activation_threshold=0.1`?**
+Default thresholds missed quiet/degraded mic audio (laptop mics on corporate WiFi with relay-only WebRTC). 0.1 is very sensitive — catches everything; Deepgram filters out non-speech downstream.
 
 ---
 
@@ -200,6 +206,28 @@ The Claude response is saved verbatim as JSONB in `InterviewExtractedData.raw_ex
 **Why fire-and-forget?**
 Evaluation takes 2–5 seconds (Claude API call + DB writes). The interview session is already over at this point. Running it in a background task lets the agent worker clean up the room immediately without waiting.
 
+### Weighted overall score — computed in CODE, not by Claude
+
+Claude returns only the four per-dimension scores (1–10). The overall score (0–100) is recalculated exactly in Python after JSON parsing — because an LLM asked to "apply weights" approximates and drifts by ±2 points:
+
+| Dimension | Weight |
+|---|---|
+| JD Fit | 35% |
+| Communication | 25% |
+| Behavioral | 15% |
+| Confidence | 15% |
+| ATS Boost | 10% |
+
+```python
+weighted   = (jd_fit*35 + communication*25 + behavioral*15 + confidence*15) / 10   # → 0–90
+ats_boost  = (ats_score / 100) * 10                                                # → 0–10
+overall    = max(0, min(100, round(weighted + ats_boost)))
+```
+
+JD Fit carries the most weight because L1 screening exists to answer one question: does this candidate match the job? The ATS boost rewards candidates the pre-screen already ranked highly.
+
+**Certifications gotcha:** the resume parser returns certifications as dicts (`{certification_name: ...}`), not strings. The prompt builder extracts `certification_name` — passing raw dicts caused `TypeError: expected str`.
+
 ---
 
 ## 13. Report Generator (Phase 7)
@@ -218,74 +246,61 @@ Server-side PDF generation (WeasyPrint, Puppeteer) adds heavy dependencies and c
 **Why `/report/html` is excluded from tenant middleware:**
 Browsers cannot add custom headers when navigating to a URL directly. The report URL is intended to be opened in a browser — requiring a tenant header would make it inaccessible without Postman.
 
+**Why a signed report token instead of a fully open URL:**
+An open URL means anyone who guesses/leaks an interview UUID can read a candidate's full evaluation. The route now requires `?token=` — a JWT (`type: report`, HS256, 7-day expiry) created by `create_report_token()` when the report is generated and embedded into `report_url`. `verify_report_token()` checks signature, expiry, type, and interview_id match. Same pattern as the candidate invite token — auth via signed URL where headers are impossible.
+
 ---
 
-## 14. Simli Avatar (Phase 7.5)
+## 14. Simli Avatar (Phase 7.5 → 10.5)
 
-**File:** `app/realtime/avatar_session.py`
+**Current implementation:** official `livekit-plugins-simli==1.5.11` plugin, used directly in `agent.py`.
+**Legacy file:** `app/realtime/avatar_session.py` — custom bridge, NO LONGER USED (kept for reference).
 
 ### Why Simli and not HeyGen/Tavus/D-ID?
 
 | Tool | Cost/min | LiveKit native | Accept raw audio | Verdict |
 |---|---|---|---|---|
-| **Simli** | $0.009 | ✅ (TransportMode.LIVEKIT) | ✅ PCM direct | **Chosen** |
+| **Simli** | $0.009 | ✅ official plugin | ✅ PCM direct | **Chosen** |
 | Tavus | $0.32–0.59 | ✅ plugin | ✅ | Quality but expensive |
 | HeyGen | $0.10–0.20 | ⚠️ Beta | ❌ needs own TTS | Architecture mismatch |
 | D-ID | $5.90+ | ❌ | ⚠️ Complex | Prohibitive cost |
 
 Simli is the only provider designed as pure audio-in → face-video-out with no opinion about LLM or TTS. ElevenLabs PCM bytes feed directly in. Cost is negligible (~₹0.75 per 30-min interview).
 
-### Audio pipeline (no double audio)
+### Why the official plugin replaced the custom bridge — CRITICAL LESSON
 
-**Why `_VideoOnlyPublisher` instead of `LivekitRenderer`?**
+The first implementation (`avatar_session.py`) ran Simli **in-process**: a custom `SimliAudioForwarder` tapped TTS audio, and a `_VideoOnlyPublisher` pumped 30fps video frames through the agent's own event loop. The `frame.to_ndarray().tobytes()` conversion at 30fps **starved the asyncio event loop** — candidate microphone audio frames were never processed, VAD never fired, and the agent logged "input speech hasn't started yet" forever. **Symptom: mic worked perfectly without the avatar, died the moment the avatar started.** Thread-pool offloading and `auto_gain_control=False` reduced but did not eliminate the starvation.
 
-The built-in `LivekitRenderer` publishes BOTH video AND audio to the room via `AVSynchronizer`. The audio it publishes is the same ElevenLabs audio re-processed by Simli — candidates heard it twice.
+The official plugin fixes this architecturally:
 
-`_VideoOnlyPublisher`:
-- Connects to the room as `simli-avatar`
-- Publishes ONLY the video track (no audio track registered)
-- Pumps `yuva420p` frames directly via `VideoSource.capture_frame()` — no `AVSynchronizer`
-- Zero risk of double audio
-
-**Why `VideoSource.capture_frame()` directly (not AVSynchronizer)?**
-`AVSynchronizer` requires both audio AND video pushes to maintain sync. Since we have video-only, direct `capture_frame()` is correct. Without audio to wait for, there's nothing to synchronise against.
-
-### SimliAudioForwarder — how it sits in the pipeline
-
-`livekit.agents.io.AudioOutput` has 3 abstract methods:
-- `capture_frame(frame)` — called per PCM frame from TTS output
-- `flush()` — called when a speech segment ends
-- `clear_buffer()` — called on interruption (barge-in)
-
-`SimliAudioForwarder` implements all three. For each frame:
-1. Converts stereo → mono if needed (`audioop.tomono`)
-2. Resamples from ElevenLabs rate → 16 kHz (`audioop.ratecv`)
-3. Buffers until 6000 bytes → sends chunk to Simli (`_safe_send`)
-4. Calls `next_in_chain.capture_frame(frame)` → room audio → candidate hears normally
-
-**Why insert into chain after `session.start()`?**
-`session.output.audio` is read by `agent_activity.py` dynamically on each speech turn (not captured at startup). Setting it after `session.start()` works correctly. Setting it before risks it being overwritten by RoomIO setup.
-
-**Why `_avatar_holder` list pattern?**
-`on_shutdown` is defined before the avatar is created. A mutable list lets the closure reference an object that doesn't exist yet:
 ```python
-_avatar_holder: list[AvatarSession] = []   # defined before on_shutdown
-# in on_shutdown: if _avatar_holder: await _avatar_holder[0].stop()
-# after session.start(): _avatar_holder.append(avatar)
+avatar = simli.AvatarSession(
+    simli_config=simli.SimliConfig(api_key=..., face_id=...),
+    avatar_participant_identity="simli-avatar",
+    avatar_participant_name="Sarah",
+)
+await avatar.start(session, room=ctx.room, livekit_url=..., livekit_api_key=..., livekit_api_secret=...)
 ```
-Only ONE shutdown callback is registered. Do not add a second one.
 
-**PCM format Simli requires:**
-- Sample rate: 16 000 Hz
-- Bit depth: 16-bit signed (PCM16)
-- Channels: mono
-- Chunk size: 6000 bytes (~187 ms)
-- `audioop.ratecv(data, 2, 1, src_rate, 16000, None)` — stdlib, no extra dependency (Python 3.12)
+- The avatar runs as a **separate LiveKit worker** — zero work on the agent's event loop, so candidate audio processing is never starved.
+- It must be started **BEFORE `session.start()`** (it wires itself into the session's output).
+- The `simli-avatar` participant publishes **both** lip-synced video AND the agent's voice audio.
+- Because the avatar republishes the voice, the room's own audio output must be disabled to avoid double audio:
 
-**Browser side (interview.html):**
-- `<video id="avatar-video">` positioned absolutely over plasma canvas, `border-radius:50%`, `z-index:2`, `display:none` initially
-- On `TrackSubscribed` from `simli-avatar` participant: `track.attach(videoEl)`, show video, hide canvas
-- No Simli audio track is ever published — no muting needed in browser
+```python
+await session.start(
+    room=ctx.room,
+    agent=hr_agent,
+    room_options=room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(auto_gain_control=False),
+        audio_output=(not avatar_active),   # avatar publishes voice itself
+    ),
+)
+```
+
+**Browser side (interview.html):** plays ALL audio tracks — including from the `simli-avatar` participant (the old `!isSimliAvatar` filter was removed; with the official plugin, the voice comes FROM the avatar participant). Video from `simli-avatar` is attached over the plasma canvas; plasma remains the fallback if avatar fails.
+
+**Graceful degradation:** if `SIMLI_API_KEY`/`SIMLI_FACE_ID` is missing or `avatar.start()` throws, `avatar_active=False` → room audio output is enabled → voice-only interview. Avatar failure can never kill an interview.
 
 ---
 
@@ -330,6 +345,49 @@ All components reference these — changing one token rebrands the whole page.
 
 ---
 
+## 15.5 In-Interview Crash Recovery (Phase 11)
+
+**File:** `app/realtime/crash_recovery.py`
+
+### Design constraint: a SEPARATE unit
+Explicit requirement: do not touch the agent pipeline internals. All recovery logic lives in one self-contained module with its **own DB engine** (`pool_size=2, max_overflow=3, pool_pre_ping`) so it never competes with the agent's DB pool. `agent.py` only calls thin hooks marked `CRASH RECOVERY HOOK`.
+
+### Capability 1 — 60s disconnect grace period
+**Problem:** a page reload fires `participant_disconnected`, which previously ran `ctx.shutdown()` instantly — the interview was finalized and could never continue.
+**Fix:** `DisconnectGraceTimer`. `candidate_left()` starts a 60s asyncio countdown; `candidate_returned()` cancels it and returns `True` if a countdown was active (i.e., this is a reconnect → Sarah re-greets). Only if the countdown expires does `ctx.shutdown()` run the normal completion path.
+**Tradeoff:** "End Interview" also looks like a disconnect → evaluation starts ~60s after the candidate leaves.
+
+**CRITICAL companion setting — `close_on_disconnect=False`:**
+The SDK's RoomIO defaults to `close_on_disconnect=True`, which closes the AgentSession the INSTANT the linked participant disconnects — before the grace timer can do anything. Symptom: grace timer logs "RECONNECTED within grace period" but the re-greet throws `RuntimeError: AgentSession isn't running`. The session must be kept alive across the disconnect:
+```python
+room_options=room_io.RoomOptions(..., close_on_disconnect=False)
+```
+Re-linking on reconnect is automatic: the candidate rejoins with the SAME identity (`candidate-{interview_id}`), and RoomIO's audio input stays subscribed to `track_subscribed` events matched by identity — the new mic track re-attaches with no extra code.
+
+**`generate_reply()` is SYNC:** it returns a `SpeechHandle`, it is not a coroutine. Wrapping the call itself in `asyncio.create_task()` is wrong. The re-greet uses an async helper (1s delay so the browser re-attaches audio, then the sync call inside try/except).
+
+### Capability 2 — stage persistence
+After every LangGraph advance (both voice and typed paths), `queue_save_stage()` fire-and-forgets the current state to `interview_contexts.question_flow` (an existing JSONB column — **no migration needed**):
+```json
+{"resume": {"stage": "notice_period", "turns_in_stage": 1,
+            "captured": {"captured_experience": true, ...}, "saved_at": "..."}}
+```
+Saves are non-fatal by design — a DB hiccup can never break the live interview.
+
+### Capability 3 — resume on a fresh agent job
+If the agent process crashes, LiveKit dispatches a new job when the candidate rejoins the room. The entrypoint calls `load_resume_state()`:
+- Returns the saved payload **only if** status is still `in_progress` AND the saved stage is meaningful (not `intro`/`complete`) — otherwise the interview starts normally.
+- `apply_resume()` restores stage, turn count, and capture flags, and **regenerates `stage_instruction`** via `interview_graph._make_instruction()` so Claude focuses on the right topic immediately.
+- The greeting is swapped for `resume_greeting_instructions()`: *"Welcome back, {name}! … we'll continue right where we left off"* + re-asks the current stage's question. A `_STAGE_TOPIC` dict maps each stage to a human-readable topic for the re-ask.
+
+### Why `_session_holder` list pattern in agent.py
+The `participant_connected` handler (which triggers the re-greet) is registered BEFORE the `AgentSession` is created. A mutable list lets the closure reach the session once it exists: `_session_holder.append(session)` after construction, `_session_holder[0].generate_reply(...)` in the handler.
+
+### Why start time is only set on FIRST join
+`participant_connected` fires again on reconnect. Overwriting `interview_start_time` would corrupt the duration calculation, so it's set only when `interview_start_time[0] is None`.
+
+---
+
 ## 16. Alembic Migrations
 
 **Why Alembic must import all models:**
@@ -354,7 +412,7 @@ Alembic runs from the CLI synchronously. The app uses `asyncpg` (async). Alembic
 | `/api/v1/interviews/{id}/evaluate` | ✅ | Internal/recruiter operation |
 | `/api/v1/interviews/{id}/evaluation` | ✅ | Internal/recruiter operation |
 | `/api/v1/interviews/{id}/report` | ✅ | Internal/recruiter operation |
-| `/api/v1/interviews/{id}/report/html` | ❌ | Browser direct URL — can't send headers |
+| `/api/v1/interviews/{id}/report/html` | ❌ (signed `?token=` instead) | Browser direct URL — can't send headers; report token (7d) required |
 
 ---
 
@@ -362,19 +420,28 @@ Alembic runs from the CLI synchronously. The app uses `asyncpg` (async). Alembic
 
 | Setting | Value | Why |
 |---|---|---|
-| STT `endpointing_ms` | 300ms | Natural pause, not sentence break |
+| STT model / language | nova-2-general / "en" | Broader detection than nova-3 + en-IN |
+| STT `endpointing_ms` | 200ms | Fast turn response, still natural pause |
+| VAD `activation_threshold` | 0.1 | Very sensitive — catches quiet/degraded mics |
+| VAD `min_speech_duration` | 0.05s | Detect short utterances ("yes") |
 | Pre-response delay | 300–600ms random | Human response time simulation |
 | Filler probability | 20% | Natural without being predictable |
-| `min_interruption_words` | 2 | Prevent cough/noise from interrupting |
+| `min_interruption_words` | 4 | Prevent short acknowledgments from interrupting |
 | `min_endpointing_delay` | 0.4s | Wait before responding |
 | `max_endpointing_delay` | 6.0s | Allow long pauses in long answers |
+| `aec_warmup_duration` | 0 | Skip echo-canceller warmup (mic debugging) |
 | ElevenLabs stability | 0.45 | Expressive, not robotic |
 | ElevenLabs style | 0.35 | Professional expressiveness |
 | LangGraph max turns/stage | 3 | Force-advance if candidate is vague |
-| Simli chunk size | 6000 bytes | ~187ms at 16 kHz PCM16 mono |
-| Simli sample rate | 16 000 Hz | Simli's required input format |
+| Disconnect grace period | 60s | Reload-proof; survives network blips |
+| Eval weights | 35/25/15/15 + 10 ATS | JD Fit / Comm / Behav / Conf + ATS boost |
+| Agent DB pool | 5 + 10 overflow | Per worker job process |
+| Crash recovery DB pool | 2 + 3 overflow | Isolated from agent pool |
+| FastAPI DB pool | 10 + 20 overflow | Request-scoped sessions |
 | LiveKit max_participants | 3 | Agent + candidate + simli-avatar |
-| Report HTML route | No tenant auth | Browser-openable URL |
+| LiveKit empty_timeout | 30s | Close room shortly after last leave |
+| Invite token expiry | 24h | Candidate join link |
+| Report token expiry | 7 days | Recruiter report link |
 
 ---
 
@@ -382,27 +449,46 @@ Alembic runs from the CLI synchronously. The app uses `asyncpg` (async). Alembic
 
 | Error | Cause | Fix |
 |---|---|---|
-| `anthropic.AuthenticationError` in agent worker | `load_dotenv()` not called / key not passed explicitly | `load_dotenv()` at top of agent.py; `api_key=os.environ[...]` in LLM constructor |
+| `anthropic.AuthenticationError` in agent worker | `load_dotenv()` not called / key not passed explicitly | Absolute-path `load_dotenv()` at top of agent.py; `api_key=os.environ[...]` in LLM constructor |
 | `anthropic.NotFoundError: model: claude-*` | Model not on this API key's account | Use `claude-haiku-4-5-20251001` only |
 | `UndefinedTableError: relation "..." does not exist` | Migration not run | `venv\Scripts\python -m alembic upgrade head` |
-| Voice repeating 2–3 times | `LivekitRenderer` publishing audio AND agent publishing audio | Use `_VideoOnlyPublisher` (video-only) |
+| Transcripts never saved (silent) | Plain `load_dotenv()` failed when worker started from another cwd → empty `DATABASE_URL` | Load `.env` by absolute path from `__file__` |
+| AI turns never saved | `turn_ctx` in `on_user_turn_completed` is a temporary copy — assistant reply isn't in it | Capture via `session.on("conversation_item_added")` |
+| `PostgresSyntaxError: syntax error at or near ":"` | `:param::jsonb` cast breaks SQLAlchemy named-param parsing with asyncpg | `bindparam("x", type_=PG_JSONB)` + pass Python list/dict |
+| `function jsonb_concat(jsonb, text) does not exist` | JSON passed as string, not typed jsonb | Same `bindparam(type_=PG_JSONB)` fix |
+| Mic dead ONLY when avatar active | Custom Simli bridge's 30fps in-process rendering starved the event loop — VAD never ran | Official `livekit-plugins-simli` (avatar = separate worker) |
+| "input speech hasn't started yet" forever | Same event-loop starvation, or track not subscribed | Official plugin + explicit `publication.set_subscribed(True)` for candidate audio |
+| Voice repeating / double audio | Both avatar AND room publishing the agent's voice | `room_options.audio_output=(not avatar_active)` |
+| Avatar video but NO voice | Browser filtered out `simli-avatar` audio (old `!isSimliAvatar` check) | interview.html plays ALL audio tracks |
+| ElevenLabs 401 `detected_unusual_activity` | Free-tier abuse block | Paid plan (Creator) + restart worker to reload key |
+| Interview stuck `in_progress` forever | Candidate leaving never ended the agent job; also `hr_agent` referenced before definition in `on_shutdown` | Grace timer → `ctx.shutdown()`; create `hr_agent` before registering `on_shutdown` |
+| `UniqueViolationError` on re-trigger (jobs) | Blind INSERT of candidate/job/ats rows | UPSERT pattern in context_builder (SELECT then update-or-insert) |
+| `TypeError: expected str, dict found` in evaluation | Certifications are dicts | Extract `certification_name` |
+| Reload kills interview | Instant shutdown on `participant_disconnected` | 60s `DisconnectGraceTimer` (crash_recovery.py) |
+| `RuntimeError: AgentSession isn't running` on reconnect | RoomIO default `close_on_disconnect=True` closed the session the moment the candidate disconnected | `room_io.RoomOptions(close_on_disconnect=False)` — grace timer owns finalization |
+| `400 X-Tenant-ID header required` on report URL | Route not excluded from middleware | `path.endswith("/report/html")` in `_is_excluded()` + signed `?token=` |
 | `classList.add('')` DOMException | Empty string passed to classList | Use class assignment (`className = 'av-glow idle'`) |
-| `400 X-Tenant-ID header required` on report URL | Route not excluded from middleware | Add `path.endswith("/report/html")` to `_is_excluded()` |
-| Avatar not showing | `SIMLI_API_KEY` or `SIMLI_FACE_ID` empty | Add both to `.env`. Check simli.com dashboard for face_id. |
+| Avatar not showing | `SIMLI_API_KEY` or `SIMLI_FACE_ID` empty, or Simli concurrent-session limit hit | Add keys to `.env`; check Simli plan limits |
+| SMTP 535 auth failed | Gmail requires App Password, not account password | Generate App Password in Google account settings |
 
 ---
 
-## 20. Pending Phases
+## 20. Build Status & What's Next
 
-### Phase 8 — Workflow Durability
-On server restart: scan `interviews` for `status = 'completed'` with no `InterviewScore` row → re-trigger `run_evaluation`. On evaluation crash: DB-backed retry counter, exponential backoff.
+### Completed (Phases 1–11)
+All core phases are DONE: DB models + migrations, FastAPI app, context building, voice pipeline, real-time transcripts, weighted evaluation engine, recruiter report (signed token URL), official Simli avatar, workflow recovery (APScheduler), hardening (rate limits, structured logging, systemd/EC2 scripts), signed invite tokens + auto email, and in-interview crash recovery (60s grace + stage persistence + "Welcome back" resume).
 
-### Phase 9 — Hardening + Deployment
-- `slowapi` rate limiting on trigger endpoint (per tenant)
-- Structured JSON logging with request IDs (`python-json-logger`)
-- ELK Stack or Grafana+Loki for log aggregation
-- systemd unit files for both processes on EC2
-- nginx reverse proxy + SSL via certbot
-- AWS Secrets Manager instead of `.env` file
-- IAM role for S3 (remove static access keys from env)
-- `gunicorn -k uvicorn.workers.UvicornWorker` for multi-process FastAPI in production
+### Capacity (current single-machine dev setup)
+- **With avatar: ~1–3 concurrent interviews** — Simli plan session limit is the wall
+- **Voice-only: ~5–8 concurrent** — ElevenLabs Creator allows ~5 concurrent TTS streams
+- **Monthly volume: ~40–50 interviews** — ElevenLabs Creator = 131k chars/month
+- Scaling out = run more agent workers on more machines (LiveKit load-balances jobs automatically); upgrade ElevenLabs/Simli plans; tune PG `max_connections`
+
+### Pending / planned
+- Email verification on join page (verify candidate email against token before start)
+- Recruiter dashboard (transcript, scores, approve/reject, forward to L2)
+- JWT Bearer auth for recruiter APIs (replace X-Tenant-ID)
+- Telephony (FreeSWITCH/Asterisk phone interviews)
+- Multi-agent architecture (HR / Technical / Fraud / Observer / Summary agents)
+- ngrok / public deployment for team testing (in progress)
+- Cosmetic: "playback_finished called more times than captured" warning (harmless, parked)

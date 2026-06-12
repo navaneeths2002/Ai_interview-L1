@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # Simli Avatar
     simli_api_key: str = ""
     simli_face_id: str = ""
+    avatar_enabled: bool = True  # false → reliable voice-only mode (no avatar single-point-of-failure)
 
     # Email
     smtp_host: str = "smtp.gmail.com"

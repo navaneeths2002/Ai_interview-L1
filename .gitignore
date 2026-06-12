@@ -19,3 +19,5 @@ alembic/versions/*.py
 # Logs
 *.log
 ngrok.exe
+
+knowledge_graph.html
