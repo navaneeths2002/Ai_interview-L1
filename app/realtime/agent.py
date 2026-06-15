@@ -548,6 +548,101 @@ async def entrypoint(ctx: JobContext):
     # garbage-collected before it runs (e.g. the re-greet vanishing mid-sleep)
     _pending_tasks: set[asyncio.Task] = set()
 
+    # ── Avatar lifecycle (Simli) ──────────────────────────────────────────────
+    # Held in a list so the reconnect handler (registered before the avatar
+    # exists) can reach and RESTART it. Per Simli: the avatar is torn down on
+    # EVERY candidate disconnect (per-minute billing), so the audio pipe dies on
+    # reload. The fix they recommend is to start a FRESH AvatarSession on
+    # reconnect — the old one already disconnected, so concurrency is unaffected.
+    _avatar_holder: list = []
+
+    # AVATAR_ENABLED=false → voice-only (room publishes audio directly). Reliable
+    # on unstable networks: with the avatar active ALL voice routes through the
+    # Simli worker, so a broken agent→avatar pipe leaves the candidate with text
+    # but no voice. Voice-only has no such single point of failure.
+    avatar_enabled = os.environ.get("AVATAR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+    # AVATAR_FALLBACK_TO_ROOM_AUDIO=true → if the avatar cannot be (re)started,
+    # publish Sarah's voice via a normal room audio track so the candidate still
+    # HEARS her (the face just won't animate). Safety net — toggle for testing
+    # and future use. Default on.
+    avatar_fallback_enabled = os.environ.get("AVATAR_FALLBACK_TO_ROOM_AUDIO", "true").strip().lower() not in ("false", "0", "no")
+    simli_api_key = os.environ.get("SIMLI_API_KEY", "")
+    simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
+
+    async def _start_avatar() -> bool:
+        """Create + start a FRESH Simli AvatarSession bound to the live session.
+        Used at startup AND on every reconnect. Returns True if active.
+        avatar.start() re-points session.output.audio to the new avatar's data
+        stream, which is exactly what re-links the audio pipe after a reload."""
+        if not avatar_enabled:
+            return False
+        if not (simli_api_key and simli_face_id):
+            logger.info("Simli keys not set — voice-only mode", extra={"interview_id": interview_id})
+            return False
+        if not _session_holder:
+            return False
+        session_ref = _session_holder[0]
+        # Detach any previous (now-disconnected) avatar first so its stale
+        # conversation_item_added listener and join task are released.
+        if _avatar_holder:
+            old = _avatar_holder.pop()
+            try:
+                await old.aclose()
+            except Exception as e:
+                logger.debug(f"[avatar] old avatar aclose ignored: {e}")
+        try:
+            av = simli.AvatarSession(
+                simli_config=simli.SimliConfig(api_key=simli_api_key, face_id=simli_face_id),
+                avatar_participant_identity="simli-avatar",
+                avatar_participant_name="Sarah",
+            )
+            await av.start(
+                session_ref,
+                room=ctx.room,
+                livekit_url=os.environ.get("LIVEKIT_URL", ""),
+                livekit_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
+                livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
+            )
+            _avatar_holder.append(av)
+            logger.info("Simli avatar active (official plugin)", extra={"interview_id": interview_id})
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Simli avatar failed to start — {e}",
+                extra={"interview_id": interview_id},
+            )
+            return False
+
+    async def _fallback_to_room_audio() -> None:
+        """Safety net: route Sarah's voice through a room audio track when the
+        avatar cannot be (re)started, so the candidate still hears her even if
+        the face is gone. Toggle via AVATAR_FALLBACK_TO_ROOM_AUDIO."""
+        if not avatar_fallback_enabled or not _session_holder:
+            return
+        session_ref = _session_holder[0]
+        try:
+            from livekit import rtc
+            from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
+            room_audio = _ParticipantAudioOutput(
+                room=ctx.room,
+                sample_rate=24000,
+                num_channels=1,
+                track_publish_options=rtc.TrackPublishOptions(
+                    source=rtc.TrackSource.SOURCE_MICROPHONE
+                ),
+            )
+            await room_audio.start()
+            session_ref.output.audio = room_audio
+            logger.info(
+                "[avatar] fallback ACTIVE — voice now via room audio (face disabled)",
+                extra={"interview_id": interview_id},
+            )
+        except Exception as e:
+            logger.error(
+                f"[avatar] room-audio fallback failed: {e}",
+                extra={"interview_id": interview_id},
+            )
+
     # ── FIX 4: Create hr_agent BEFORE on_shutdown ─────────────────────────────
     # Previously hr_agent was created AFTER on_shutdown was defined and
     # registered. If shutdown fired before hr_agent was assigned, the closure
@@ -673,16 +768,28 @@ async def entrypoint(ctx: JobContext):
         )
 
         # Sarah re-greets: "Welcome back…" and re-asks the current question.
-        # generate_reply() is SYNC (returns a SpeechHandle) — do not wrap the
-        # call itself in create_task. Small delay lets the browser re-attach
-        # the audio track before Sarah starts speaking.
-        # The task reference MUST be held (_pending_tasks) — an unreferenced
-        # asyncio task can be garbage-collected mid-sleep and silently vanish.
+        # IMPORTANT: with the avatar active, Simli tore it down on the disconnect,
+        # so we must RESTART it (or fall back to room audio) BEFORE re-greeting —
+        # otherwise the speech streams to a dead avatar participant and is silent.
+        # generate_reply() is SYNC (returns a SpeechHandle) — do not wrap the call
+        # itself in create_task. The task reference MUST be held (_pending_tasks)
+        # — an unreferenced asyncio task can be GC'd mid-await and silently vanish.
         stage = hr_agent._graph_state.get("stage", "intro")
         if is_reconnect and _session_holder and stage not in ("complete", "wrap_up"):
 
-            async def _regreet() -> None:
-                await asyncio.sleep(1.0)
+            async def _resume() -> None:
+                # Re-link the audio pipe first.
+                if avatar_enabled:
+                    restarted = await _start_avatar()
+                    if not restarted:
+                        # Avatar couldn't come back — keep the candidate in audio.
+                        await _fallback_to_room_audio()
+                    # Let the fresh avatar (or room track) settle before speaking.
+                    await asyncio.sleep(1.5)
+                else:
+                    # Voice-only: brief settle so the browser re-attaches audio.
+                    await asyncio.sleep(1.0)
+
                 logger.info(
                     f"[crash-recovery] re-greeting candidate (stage={stage})",
                     extra={"interview_id": interview_id},
@@ -703,7 +810,7 @@ async def entrypoint(ctx: JobContext):
                         extra={"interview_id": interview_id},
                     )
 
-            task = asyncio.create_task(_regreet(), name="crash-recovery-regreet")
+            task = asyncio.create_task(_resume(), name="crash-recovery-resume")
             _pending_tasks.add(task)
             task.add_done_callback(_pending_tasks.discard)
 
@@ -766,49 +873,18 @@ async def entrypoint(ctx: JobContext):
     # ── Avatar via OFFICIAL livekit-plugins-simli (must start BEFORE session) ──
     # The official plugin dispatches the avatar as a SEPARATE LiveKit worker that
     # renders video + republishes audio. It does NOT run on this event loop, so
-    # it cannot starve the candidate-audio pipeline (the root cause of the
-    # custom-forwarder approach failing). When active, the avatar publishes the
-    # agent's voice itself — so we disable the room's own audio output to avoid
-    # double audio.
-    # AVATAR_ENABLED=false → run voice-only (room publishes audio directly).
-    # This is the RELIABLE mode on unstable networks: when the avatar is active
-    # all voice is routed through the Simli worker, so a network blip that kills
-    # the agent→avatar audio pipe leaves the candidate with text but NO voice.
-    # Voice-only has no such single point of failure.
-    avatar_enabled = os.environ.get("AVATAR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
-    simli_api_key = os.environ.get("SIMLI_API_KEY", "")
-    simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
-    avatar_active = False
-
+    # it cannot starve the candidate-audio pipeline. When active, the avatar
+    # publishes the agent's voice itself — so we disable the room's own audio
+    # output to avoid double audio. Startup goes through _start_avatar() so the
+    # exact same code path is reused on reconnect.
     if not avatar_enabled:
         logger.info("AVATAR_ENABLED=false — voice-only mode (reliable)", extra={"interview_id": interview_id})
-    elif simli_api_key and simli_face_id:
-        try:
-            avatar = simli.AvatarSession(
-                simli_config=simli.SimliConfig(
-                    api_key=simli_api_key,
-                    face_id=simli_face_id,
-                ),
-                avatar_participant_identity="simli-avatar",
-                avatar_participant_name="Sarah",
-            )
-            await avatar.start(
-                session,
-                room=ctx.room,
-                livekit_url=os.environ.get("LIVEKIT_URL", ""),
-                livekit_api_key=os.environ.get("LIVEKIT_API_KEY", ""),
-                livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET", ""),
-            )
-            avatar_active = True
-            logger.info("Simli avatar active (official plugin)", extra={"interview_id": interview_id})
-        except Exception as e:
-            logger.warning(
-                f"Simli avatar failed to start — falling back to voice-only: {e}",
-                extra={"interview_id": interview_id},
-            )
-            avatar_active = False
-    else:
-        logger.info("Simli keys not set — voice-only mode", extra={"interview_id": interview_id})
+    avatar_active = await _start_avatar()
+    if avatar_enabled and not avatar_active:
+        logger.info(
+            "[avatar] not active at startup — voice-only via room audio",
+            extra={"interview_id": interview_id},
+        )
 
     await session.start(
         room=ctx.room,

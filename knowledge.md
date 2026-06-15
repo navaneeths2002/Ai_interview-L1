@@ -300,7 +300,9 @@ await session.start(
 
 **Browser side (interview.html):** plays ALL audio tracks — including from the `simli-avatar` participant (the old `!isSimliAvatar` filter was removed; with the official plugin, the voice comes FROM the avatar participant). Video from `simli-avatar` is attached over the plasma canvas; plasma remains the fallback if avatar fails.
 
-**Graceful degradation:** if `SIMLI_API_KEY`/`SIMLI_FACE_ID` is missing or `avatar.start()` throws, `avatar_active=False` → room audio output is enabled → voice-only interview. Avatar failure can never kill an interview.
+**Graceful degradation:** if `SIMLI_API_KEY`/`SIMLI_FACE_ID` is missing or `avatar.start()` throws, `avatar_active=False` → room audio output is enabled → voice-only interview. `AVATAR_ENABLED=false` forces voice-only outright. Avatar failure can never kill an interview.
+
+**Reconnect handling:** Simli tears the avatar down on every candidate disconnect, so on reconnect the avatar is **restarted** (`_start_avatar()`), with an optional fallback to room audio (`AVATAR_FALLBACK_TO_ROOM_AUDIO`). See §15.5 Capability 4 for the full mechanism — this is the single most important thing to understand about the avatar.
 
 ---
 
@@ -364,7 +366,9 @@ room_options=room_io.RoomOptions(..., close_on_disconnect=False)
 ```
 Re-linking on reconnect is automatic: the candidate rejoins with the SAME identity (`candidate-{interview_id}`), and RoomIO's audio input stays subscribed to `track_subscribed` events matched by identity — the new mic track re-attaches with no extra code.
 
-**`generate_reply()` is SYNC:** it returns a `SpeechHandle`, it is not a coroutine. Wrapping the call itself in `asyncio.create_task()` is wrong. The re-greet uses an async helper (1s delay so the browser re-attaches audio, then the sync call inside try/except).
+**`generate_reply()` is SYNC:** it returns a `SpeechHandle`, it is not a coroutine. Wrapping the call itself in `asyncio.create_task()` is wrong. The re-greet uses an async helper (delay so the avatar/audio re-attaches, then the sync call inside try/except).
+
+**Hold the re-greet task reference:** the resume task does `await asyncio.sleep(...)`; an `asyncio.create_task()` whose result isn't referenced can be **garbage-collected mid-sleep** and silently vanish (symptom: re-greet never fires, no error). Kept alive in a `_pending_tasks` set with a done-callback to discard.
 
 ### Capability 2 — stage persistence
 After every LangGraph advance (both voice and typed paths), `queue_save_stage()` fire-and-forgets the current state to `interview_contexts.question_flow` (an existing JSONB column — **no migration needed**):
@@ -380,11 +384,28 @@ If the agent process crashes, LiveKit dispatches a new job when the candidate re
 - `apply_resume()` restores stage, turn count, and capture flags, and **regenerates `stage_instruction`** via `interview_graph._make_instruction()` so Claude focuses on the right topic immediately.
 - The greeting is swapped for `resume_greeting_instructions()`: *"Welcome back, {name}! … we'll continue right where we left off"* + re-asks the current stage's question. A `_STAGE_TOPIC` dict maps each stage to a human-readable topic for the re-ask.
 
-### Why `_session_holder` list pattern in agent.py
-The `participant_connected` handler (which triggers the re-greet) is registered BEFORE the `AgentSession` is created. A mutable list lets the closure reach the session once it exists: `_session_holder.append(session)` after construction, `_session_holder[0].generate_reply(...)` in the handler.
+### Capability 4 — avatar restart on reconnect (`_start_avatar` / `_fallback_to_room_audio` in agent.py)
+**The hardest bug.** When the avatar is active, `avatar.start()` sets `session.output.audio = DataStreamAudioOutput(destination_identity="simli-avatar")` — all of Sarah's voice streams to the `simli-avatar` participant. Per Simli's own support: **the avatar is torn down on EVERY candidate disconnect** (they bill per connected minute). So after a reload the audio pipe points at a dead participant → `no stream available` / `failed to perform clear buffer rpc`, the session destabilizes, and the candidate re-drops a few seconds later. (Voice-only has no such pipe — the room re-subscribes the audio track natively, which is why voice-only recovery "just works.")
+
+**Fix (Simli's recommendation):** on reconnect, start a **fresh** `AvatarSession`.
+- `_start_avatar()` is the single startup path (used at boot AND on reconnect). On reconnect it `aclose()`s the stale avatar first (releases its `conversation_item_added` listener + join task), then starts a new one — which re-runs the `session.output.audio = DataStreamAudioOutput(...)` line, re-linking the pipe.
+- A new `AvatarSession` = a new Simli billing session, but concurrency is unaffected because the old one already disconnected (confirmed by Simli).
+- The reconnect handler restarts the avatar **before** the re-greet, then waits ~1.5s for it to settle, so "Welcome back" actually has a live avatar to render it.
+
+**`_fallback_to_room_audio()` — toggleable safety net (`AVATAR_FALLBACK_TO_ROOM_AUDIO`, default on).** If the restart fails, it constructs a `_ParticipantAudioOutput` (internal SDK class) and assigns `session.output.audio` to it, so Sarah's voice publishes as a normal room track and the candidate still hears her (face just won't animate). Wrapped in try/except — an SDK change can never crash the interview. This is the "fallback" Simli deferred to the LiveKit team; we built a minimal version.
+
+### Capability 5 — client rejoin (interview.html)
+A full browser **F5** destroys the page; on reload it would show the fresh **Start Interview** screen, so the candidate never gets back in (the server is holding the session, but the client doesn't return). Fix: the on-load token prefetch checks `status === "in_progress"` and, if so, relabels the button to **"Rejoin Interview"** + shows a "Welcome back" prompt.
+**Why one click, not silent auto-join:** browsers block audio autoplay until a user gesture, and a page reload doesn't count. A silent auto-join would connect with **no voice** until the candidate interacted. The single Rejoin click both reconnects AND unlocks audio. The candidate must click within the 60s grace window.
+
+### Why `_session_holder` / `_avatar_holder` list pattern in agent.py
+The `participant_connected` handler (which triggers the re-greet + avatar restart) is registered BEFORE the `AgentSession` and avatar exist. Mutable lists let the closure reach them once created: `_session_holder.append(session)`, `_avatar_holder` holds the live `AvatarSession` so the reconnect handler can `aclose()` + restart it.
 
 ### Why start time is only set on FIRST join
 `participant_connected` fires again on reconnect. Overwriting `interview_start_time` would corrupt the duration calculation, so it's set only when `interview_start_time[0] is None`.
+
+### The avatar+reconnect root cause was the worker's network
+The `publisher connection timeout` that crashed `_audio_forwarding_task` is the **agent worker's** connection to LiveKit Cloud, not the candidate's. Proven by hotspot test: on a stable network the avatar holds; on corporate WiFi it dies. Same root cause as the browser needing `iceTransportPolicy: "relay"`. In production (worker on EC2) this largely disappears.
 
 ---
 
@@ -433,7 +454,10 @@ Alembic runs from the CLI synchronously. The app uses `asyncpg` (async). Alembic
 | ElevenLabs stability | 0.45 | Expressive, not robotic |
 | ElevenLabs style | 0.35 | Professional expressiveness |
 | LangGraph max turns/stage | 3 | Force-advance if candidate is vague |
-| Disconnect grace period | 60s | Reload-proof; survives network blips |
+| Disconnect grace period | 60s | Reload-proof; survives network blips (`GRACE_PERIOD_SECONDS`) |
+| `AVATAR_ENABLED` | true | false → reliable voice-only (no avatar SPOF) |
+| `AVATAR_FALLBACK_TO_ROOM_AUDIO` | true | voice via room track if avatar (re)start fails |
+| Avatar re-greet settle delay | ~1.5s | Lets the restarted avatar publish before Sarah speaks |
 | Eval weights | 35/25/15/15 + 10 ATS | JD Fit / Comm / Behav / Conf + ATS boost |
 | Agent DB pool | 5 + 10 overflow | Per worker job process |
 | Crash recovery DB pool | 2 + 3 overflow | Isolated from agent pool |
@@ -466,6 +490,10 @@ Alembic runs from the CLI synchronously. The app uses `asyncpg` (async). Alembic
 | `TypeError: expected str, dict found` in evaluation | Certifications are dicts | Extract `certification_name` |
 | Reload kills interview | Instant shutdown on `participant_disconnected` | 60s `DisconnectGraceTimer` (crash_recovery.py) |
 | `RuntimeError: AgentSession isn't running` on reconnect | RoomIO default `close_on_disconnect=True` closed the session the moment the candidate disconnected | `room_io.RoomOptions(close_on_disconnect=False)` — grace timer owns finalization |
+| Re-greet never fires after reconnect (no log, no error) | Unreferenced `asyncio.create_task` GC'd mid-`sleep` | Hold the task in a `_pending_tasks` set with done-callback discard |
+| Avatar silent / frozen after reconnect, candidate re-drops; `no stream available`, `failed to perform clear buffer rpc` | Simli tears the avatar down on disconnect; audio pipe points at a dead participant | Restart a fresh `AvatarSession` on reconnect (`_start_avatar()`); `_fallback_to_room_audio()` if it fails |
+| After browser F5, candidate lands on Start screen (recovery "not working") | Client never auto-rejoins; only the Start button triggers a join | `interview.html` prefetch detects `status=in_progress` → "Rejoin Interview" one-click (gesture also unlocks audio autoplay) |
+| `Extra inputs are not permitted` (pydantic) when adding an `.env` var | Every `.env` key must be declared in `Settings` (config.py) | Add the field (e.g. `avatar_enabled: bool`, `avatar_fallback_to_room_audio: bool`) |
 | `400 X-Tenant-ID header required` on report URL | Route not excluded from middleware | `path.endswith("/report/html")` in `_is_excluded()` + signed `?token=` |
 | `classList.add('')` DOMException | Empty string passed to classList | Use class assignment (`className = 'av-glow idle'`) |
 | Avatar not showing | `SIMLI_API_KEY` or `SIMLI_FACE_ID` empty, or Simli concurrent-session limit hit | Add keys to `.env`; check Simli plan limits |

@@ -484,7 +484,7 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
     <div class="chat-foot">
       <div id="start-wrap">
         <button id="startBtn" class="btn-start-full">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;display:inline-block;vertical-align:middle;margin-right:7px;margin-top:-2px;"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0014 0"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>Start Interview
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;display:inline-block;vertical-align:middle;margin-right:7px;margin-top:-2px;"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0014 0"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg><span id="startBtnLabel">Start Interview</span>
         </button>
       </div>
       <div id="input-wrap" style="display:none">
@@ -640,6 +640,18 @@ function showInterviewOver(status, candidateName) {
     const initials = name.trim().split(/\s+/).map(p => p[0]).join('').slice(0, 2).toUpperCase();
     document.getElementById('h-uname').textContent = name;
     document.getElementById('h-av').textContent    = initials || '?';
+
+    // ── CRASH RECOVERY (client side) ─────────────────────────────────────────
+    // If the interview is already in progress, this page load is a REFRESH /
+    // reconnect — not a fresh start. The agent is holding the session open for
+    // 60s. Relabel the button to "Rejoin Interview" and prompt the candidate.
+    // We can't auto-join silently: browsers block audio autoplay until a user
+    // gesture, so the candidate's click both rejoins AND unlocks Sarah's voice.
+    if (cachedTokenData.status === 'in_progress') {
+      const lbl = document.getElementById('startBtnLabel');
+      if (lbl) lbl.textContent = 'Rejoin Interview';
+      addMsg('sys', 'Welcome back — your interview is still in progress. Click "Rejoin Interview" to continue right where you left off.');
+    }
   } catch (e) {
     document.getElementById('h-uname').textContent = 'Candidate';
     document.getElementById('h-av').textContent    = 'C';

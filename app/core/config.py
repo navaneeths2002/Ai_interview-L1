@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     simli_api_key: str = ""
     simli_face_id: str = ""
     avatar_enabled: bool = True  # false → reliable voice-only mode (no avatar single-point-of-failure)
+    avatar_fallback_to_room_audio: bool = True  # if avatar can't (re)start, route voice via room audio
 
     # Email
     smtp_host: str = "smtp.gmail.com"

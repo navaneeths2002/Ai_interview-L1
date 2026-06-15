@@ -364,13 +364,13 @@ POST /api/v1/admin/recovery/run      Headers: X-Tenant-ID: tenant-001
 
 ## In-Interview Crash Recovery (Phase 11)
 
-**File:** `app/realtime/crash_recovery.py` — fully self-contained unit (own DB engine, pool_size=2). The agent only calls thin marked hooks; no pipeline internals were touched.
+**Files:** `app/realtime/crash_recovery.py` (self-contained unit, own DB engine pool_size=2) + reconnect/avatar-restart hooks in `app/realtime/agent.py` + client rejoin flow in `app/static/interview.html`. The recovery *logic* is isolated in crash_recovery.py; the agent only calls thin marked hooks.
 
-Three capabilities:
+Five parts work together:
 
 **1. Disconnect grace period (60s)** — `DisconnectGraceTimer`
-A page reload or network blip looks like a disconnect. Instead of finalizing instantly, a 60-second countdown starts. If the candidate reconnects in time, the countdown is cancelled and the interview continues. If not, `ctx.shutdown()` runs the normal completion path (status → completed, evaluation, report).
-**Requires `close_on_disconnect=False` in `room_io.RoomOptions`** — the SDK default (True) closes the AgentSession the instant the candidate disconnects, which breaks the grace timer (`RuntimeError: AgentSession isn't running` on reconnect). Re-linking is automatic because the candidate rejoins with the same identity.
+A page reload or network blip looks like a disconnect. Instead of finalizing instantly, a 60-second countdown starts. If the candidate reconnects in time, the countdown is cancelled and the interview continues. If not, `ctx.shutdown()` runs the normal completion path (status → completed, evaluation, report). Grace = `GRACE_PERIOD_SECONDS = 60.0`.
+**Requires `close_on_disconnect=False` in `room_io.RoomOptions`** — the SDK default (True) closes the AgentSession the instant the candidate disconnects, which breaks the grace timer (`RuntimeError: AgentSession isn't running` on reconnect).
 
 **2. Stage persistence** — `queue_save_stage()` / `load_resume_state()`
 After every LangGraph advance (voice and typed), the current stage + turn count + capture flags are saved fire-and-forget to `interview_contexts.question_flow` (existing JSONB column — no migration). If the agent process crashes, the stage survives in the DB.
@@ -378,11 +378,20 @@ After every LangGraph advance (voice and typed), the current stage + turn count 
 **3. Resume on a fresh agent job** — `apply_resume()` + `resume_greeting_instructions()`
 When a new agent job starts for an interview that is still `in_progress` with a saved stage (not intro/complete), the LangGraph state is restored to that stage and Sarah re-greets: *"Welcome back, {name}! … we'll continue right where we left off"* — then re-asks the current stage's question instead of restarting from the introduction.
 
+**4. Avatar restart on reconnect** — `_start_avatar()` / `_fallback_to_room_audio()` (in `agent.py`)
+Per Simli, the avatar is **torn down on every candidate disconnect** (per-minute billing). Its audio pipe (`DataStreamAudioOutput` → `simli-avatar` participant) then points at a dead participant, so on reconnect the agent re-greets to a silent/frozen avatar. Fix: on reconnect (avatar mode), `aclose()` the old avatar and start a **fresh** `AvatarSession` (re-points `session.output.audio`) **before** the re-greet. Concurrency is unaffected because the old session already disconnected. If the restart fails and `AVATAR_FALLBACK_TO_ROOM_AUDIO=true`, voice falls back to a room audio track so the candidate still hears Sarah (face won't animate). The re-greet waits ~1.5s for the new avatar to settle before speaking.
+
+**5. Client rejoin (in `interview.html`)**
+A full browser refresh destroys the page → it would otherwise show the fresh **Start Interview** screen. The on-load token prefetch now checks `status === "in_progress"` and, if so, relabels the button to **"Rejoin Interview"** and shows a "Welcome back" prompt. **One click** rejoins — deliberately not auto-join, because browsers block audio autoplay until a user gesture (a silent auto-join would connect with no voice). The candidate must click Rejoin within the 60s grace window.
+
 ```
-Candidate reloads page
-    → participant_disconnected → grace_timer.candidate_left() (60s countdown)
-    → participant_connected → grace_timer.candidate_returned() == True
-    → Sarah: "Welcome back…" + re-asks current stage question
+Candidate reloads page (full F5)
+    → server: participant_disconnected → grace_timer.candidate_left() (60s countdown)
+    → new page loads → prefetch sees status=in_progress → button = "Rejoin Interview"
+    → candidate clicks Rejoin (one gesture → unlocks audio + reconnects)
+    → server: participant_connected → grace_timer.candidate_returned() == True
+        → _start_avatar() restarts Simli (or _fallback_to_room_audio())
+        → Sarah: "Welcome back…" + re-asks current stage question
     → interview continues, start time / duration NOT corrupted
 
 Agent worker crashes mid-interview
@@ -392,7 +401,11 @@ Agent worker crashes mid-interview
     → greeting = "Welcome back…" instead of fresh intro
 ```
 
-**Known tradeoff:** clicking "End Interview" also looks like a disconnect, so evaluation starts ~60s after the candidate leaves (grace period must expire first).
+**Known tradeoffs:**
+- Clicking "End Interview" also looks like a disconnect, so evaluation starts ~60s after the candidate leaves (grace period must expire first).
+- The candidate must click **Rejoin within 60s** of refreshing, or the interview finalizes.
+- Each avatar restart spins a **new Simli billing session** (concurrency unaffected — old one already gone).
+- `_fallback_to_room_audio()` uses an internal SDK class (`_ParticipantAudioOutput`); it's wrapped in try/except so a future SDK change can't crash the interview.
 
 ---
 
@@ -426,7 +439,8 @@ LIVEKIT_API_SECRET=...
 # Simli Avatar
 SIMLI_API_KEY=...
 SIMLI_FACE_ID=...
-AVATAR_ENABLED=true   # set false → reliable voice-only mode (no avatar single-point-of-failure)
+AVATAR_ENABLED=true                   # set false → reliable voice-only mode (no avatar single-point-of-failure)
+AVATAR_FALLBACK_TO_ROOM_AUDIO=true    # if avatar can't (re)start, route Sarah's voice via room audio so she's still heard
 
 # AWS (S3)
 AWS_ACCESS_KEY_ID=...
@@ -542,7 +556,8 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 - **Two processes required:** FastAPI server + agent worker must both be running.
 - **Simli is optional:** If `SIMLI_API_KEY` or `SIMLI_FACE_ID` is missing (or `avatar.start()` fails), avatar is silently disabled — voice-only mode with room audio output re-enabled.
 - **Avatar must use the official plugin:** `livekit-plugins-simli`. The custom in-process bridge (`avatar_session.py`) starved the event loop and broke mic input — do not revert to it.
-- **Avatar is a voice single-point-of-failure:** when active, ALL of Sarah's audio is routed through the Simli worker (`audio_output=(not avatar_active)`). If a network blip kills the agent→avatar audio pipe (`_audio_forwarding_task` crashes with `publisher connection timeout`), the avatar freezes and the candidate gets text but NO voice — there is no fallback to room audio mid-session. On unstable networks set `AVATAR_ENABLED=false` for reliable voice-only operation.
+- **Avatar is a voice single-point-of-failure:** when active, ALL of Sarah's audio is routed through the Simli worker (`audio_output=(not avatar_active)`). If a network blip kills the agent→avatar audio pipe (`_audio_forwarding_task` crashes with `publisher connection timeout`), the avatar freezes and the candidate gets text but NO voice. Mitigations now in place: (a) on reconnect the avatar is **restarted** (`_start_avatar()`), (b) `AVATAR_FALLBACK_TO_ROOM_AUDIO=true` re-routes voice to a room track if the restart fails, (c) `AVATAR_ENABLED=false` disables the avatar entirely for guaranteed-reliable voice-only operation on bad networks.
+- **Avatar + corporate WiFi:** the `publisher connection timeout` failures originate on the **agent worker's** connection to LiveKit Cloud, not the candidate's. Running the worker on a stable network (mobile hotspot / EC2) makes the avatar reliable; it was the corporate WiFi all along (same root cause as the browser needing `iceTransportPolicy: "relay"`).
 - **Model on account:** Only `claude-haiku-4-5-20251001` confirmed available. `claude-3-5-sonnet` and `claude-sonnet-4-5-20251001` are NOT on this account.
 - **Room max_participants = 3:** Agent + candidate + simli-avatar. Do not lower this. `empty_timeout=30s`.
 - **Email is optional:** If SMTP not configured, invite email is skipped — join_url is still returned in the trigger response and can be shared manually.
