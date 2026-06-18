@@ -36,4 +36,5 @@ async def trigger_interview(
         message=f"Interview scheduled for {result['candidate_name']}. "
                 f"Missing skills to probe: {', '.join(result['missing_skills']) or 'None'}. "
                 f"Strategy: {result['strategy_summary']}",
+        evaluation_weights=result.get("evaluation_weights"),
     )

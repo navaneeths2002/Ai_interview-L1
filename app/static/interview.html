@@ -314,9 +314,74 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
 
 /* Remove chevron from header user since we stripped the dropdown */
 .h-chev{display:none;}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   UI REFRESH — sparkles backdrop · glassmorphism · neon button
+   Additive layer (wins by source order + !important). No IDs / handlers touched.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Glass tokens */
+:root{
+  --glass:rgba(255,255,255,.70); --glassbdr:rgba(255,255,255,.65);
+  --glasshi:rgba(255,255,255,.9);
+}
+[data-theme="dark"]{
+  --glass:rgba(16,28,48,.58); --glassbdr:rgba(255,255,255,.09);
+  --glasshi:rgba(255,255,255,.06);
+}
+
+/* Layered gradient backdrop (sits behind the sparkles canvas) */
+body{
+  background:
+    radial-gradient(1100px 680px at 10% -10%, rgba(59,130,246,.18), transparent 60%),
+    radial-gradient(900px 640px at 105% 0%, rgba(234,179,8,.10), transparent 55%),
+    var(--bg);
+}
+[data-theme="dark"] body{
+  background:
+    radial-gradient(1100px 680px at 10% -10%, rgba(37,99,235,.22), transparent 60%),
+    radial-gradient(900px 640px at 105% 0%, rgba(59,130,246,.12), transparent 55%),
+    linear-gradient(160deg,#070E1E,#050A16);
+}
+
+/* Sparkles canvas — fixed, behind the whole app */
+#sparkles-bg{position:fixed;inset:0;width:100vw;height:100vh;z-index:0;pointer-events:none;}
+.app{position:relative;z-index:1;background:transparent!important;}
+
+/* Frosted-glass surfaces — translucent + blur so the backdrop shows through */
+.sidebar, header, .chat-card, .chat-foot, .rcard, .cal-panel{
+  background:var(--glass)!important;
+  -webkit-backdrop-filter:blur(18px) saturate(150%);
+  backdrop-filter:blur(18px) saturate(150%);
+  border-color:var(--glassbdr)!important;
+}
+.chat-card, .rcard{
+  box-shadow:0 8px 32px rgba(15,23,42,.10), inset 0 1px 0 var(--glasshi)!important;
+}
+
+/* Neon Start / Rejoin button — ports the neon-button hover gradient lines */
+.btn-start-full{
+  position:relative;overflow:hidden;
+  background:linear-gradient(180deg,var(--pril),var(--pri))!important;
+  box-shadow:0 6px 20px rgba(37,99,235,.32);
+}
+.btn-start-full::before,.btn-start-full::after{
+  content:"";position:absolute;left:50%;transform:translateX(-50%);
+  width:75%;height:1px;opacity:0;transition:opacity .5s ease;
+  background:linear-gradient(90deg,transparent,#93C5FD,transparent);
+}
+.btn-start-full::before{top:0;}
+.btn-start-full::after{bottom:0;}
+.btn-start-full:hover:not(:disabled)::before,
+.btn-start-full:hover:not(:disabled)::after{opacity:1;}
+.btn-start-full:hover:not(:disabled){
+  background:linear-gradient(180deg,var(--pril),var(--pri))!important;
+  box-shadow:0 8px 28px rgba(37,99,235,.55),0 0 22px rgba(59,130,246,.35);
+}
 </style>
 </head>
 <body>
+<canvas id="sparkles-bg" aria-hidden="true"></canvas>
 <div class="app">
 
 <!-- ═══════════════ SIDEBAR ═══════════════ -->
@@ -1379,6 +1444,56 @@ async function endInterview() {
   document.getElementById('startBtn').disabled = true;
   setAvatarMode('idle');
 }
+</script>
+
+<!-- Sparkles backdrop — lightweight vanilla particle field, zero dependencies -->
+<script>
+(function(){
+  const cv = document.getElementById('sparkles-bg');
+  if(!cv) return;
+  const ctx = cv.getContext('2d');
+  let w, h, dpr, parts = [], raf = null, running = true;
+  const COUNT = 70;
+  const rnd = (a,b) => a + Math.random()*(b-a);
+  const dark = () => document.documentElement.getAttribute('data-theme') === 'dark';
+
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    w = cv.width  = Math.floor(innerWidth  * dpr);
+    h = cv.height = Math.floor(innerHeight * dpr);
+    cv.style.width  = innerWidth  + 'px';
+    cv.style.height = innerHeight + 'px';
+  }
+  function make(){
+    return { x:rnd(0,w), y:rnd(0,h), r:rnd(0.6,2.2)*dpr,
+             vy:-rnd(0.05,0.35)*dpr, vx:rnd(-0.12,0.12)*dpr,
+             a:rnd(0.1,0.8), tw:rnd(0.004,0.02), dir:Math.random()<0.5?1:-1 };
+  }
+  function init(){ parts = Array.from({length:COUNT}, make); }
+  function tick(){
+    ctx.clearRect(0,0,w,h);
+    const col = dark() ? '147,197,253' : '37,99,235';   // blue-300 (dark) / blue-600 (light)
+    for(const p of parts){
+      p.x += p.vx; p.y += p.vy; p.a += p.tw * p.dir;
+      if(p.a >= 0.85){ p.a = 0.85; p.dir = -1; }
+      if(p.a <= 0.08){ p.a = 0.08; p.dir =  1; }
+      if(p.y < -5){ p.y = h + 5; p.x = rnd(0,w); }
+      if(p.x < -5) p.x = w + 5;
+      if(p.x > w + 5) p.x = -5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, 6.283);
+      ctx.fillStyle = 'rgba(' + col + ',' + p.a.toFixed(3) + ')';
+      ctx.fill();
+    }
+    if(running) raf = requestAnimationFrame(tick);
+  }
+  function start(){ if(!raf){ running = true; raf = requestAnimationFrame(tick); } }
+  function stop(){ running = false; if(raf){ cancelAnimationFrame(raf); raf = null; } }
+
+  resize(); init(); start();
+  addEventListener('resize', () => { resize(); init(); });
+  document.addEventListener('visibilitychange', () => { document.hidden ? stop() : start(); });
+})();
 </script>
 </body>
 </html>

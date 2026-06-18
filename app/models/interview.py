@@ -57,6 +57,18 @@ class InterviewContext(BaseModel):
     # Full question flow for this interview (loaded into LangGraph)
     question_flow: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
+    # Role-tuned evaluation weights — LLM-determined at trigger, consumed by
+    # evaluation_engine. Shape:
+    # {
+    #   "role_category": "client_facing",
+    #   "weights": {"jd_fit":25,"communication":40,"behavioral":20,"confidence":15,"ats":10},
+    #   "rationale": "<one line why>",
+    #   "source": "llm" | "default",
+    #   "generated_at": "<ISO-8601>"
+    # }
+    # Null for interviews created before this feature → evaluation falls back to defaults.
+    evaluation_weights: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
 
 class InterviewTranscript(BaseModel):
     """

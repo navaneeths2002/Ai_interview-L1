@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 # Upgrade to claude-opus-4-5-20251001 when available for higher evaluation quality.
 EVAL_MODEL = "claude-haiku-4-5-20251001"
 
+# Fallback weights when an interview has no role-tuned rubric (pre-feature rows,
+# or LLM failure at trigger). Mirrors strategy_builder's defaults. Sum = 100.
+DEFAULT_WEIGHTS = {"jd_fit": 35, "communication": 25, "behavioral": 15, "confidence": 15, "ats": 10}
+
 # ── System prompt ──────────────────────────────────────────────────────────────
 
 EVALUATION_SYSTEM_PROMPT = """\
@@ -85,9 +89,10 @@ Scoring guidelines:
   confidence_score     — certainty, directness, lack of hesitation (1=very hesitant, 10=confident)
   jd_fit_score         — alignment with job requirements and critical skills (1=poor, 10=perfect)
   behavioral_score     — professionalism, stability signals, attitude (1=concerning, 10=exemplary)
-  overall_score        — weighted composite:
-                          (jd_fit × 35) + (communication × 25) + (behavioral × 15)
-                          + (confidence × 15) + ats_boost (0–10 based on ATS pre-score)
+  overall_score        — a weighted composite of the four dimensions plus the ATS
+                          pre-score. The exact weights are ROLE-DEPENDENT and are
+                          applied by the system in code, so give your best estimate
+                          here; the system will recompute the authoritative value.
 
 Recommendation rules:
   proceed_to_l2 → overall_score ≥ 65  AND jd_fit ≥ 6  AND no critical red flags
@@ -418,18 +423,31 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         logger.error(f"[eval] JSON parse failed for {interview_id}: {e}")
         return False
 
-    # ── 10. Override overall_score with exact formula ─────────────────────────
-    # Claude approximates the calculation. We recompute it precisely so the
-    # score is always mathematically correct regardless of Claude's rounding.
-    # Weights: JD Fit 35% | Communication 25% | Behavioral 15% | Confidence 15% | ATS 10%
+    # ── 10. Override overall_score with the exact, ROLE-TUNED formula ─────────
+    # Claude approximates the calculation. We recompute it precisely in code so
+    # the score is always mathematically correct. The weights are role-specific:
+    # they were chosen by the LLM at interview-trigger time and stored on the
+    # InterviewContext. Each dimension (1–10) is scaled to a 0–100 sub-score and
+    # combined with the ATS pre-score (0–100) using the role weights (sum 100).
+    #   overall = Σ (sub_score_i × weight_i) / 100
     try:
-        ats_boost = (ats.total_score / 100) * 10 if ats else 0
+        w = (context.evaluation_weights or {}).get("weights") if context else None
+        if not isinstance(w, dict) or not w:
+            w = DEFAULT_WEIGHTS
+            logger.info("[eval] no role-tuned weights found — using defaults")
+        else:
+            logger.info(
+                f"[eval] role-tuned weights "
+                f"({(context.evaluation_weights or {}).get('role_category')}): {w}"
+            )
+
+        ats_sub = ats.total_score if ats else 0          # already 0–100
         exact_score = round(
-            (result.get("jd_fit_score",        0) * 35 +
-             result.get("communication_score",  0) * 25 +
-             result.get("behavioral_score",     0) * 15 +
-             result.get("confidence_score",     0) * 15) / 10
-            + ats_boost
+            (result.get("jd_fit_score",        0) * 10) * w.get("jd_fit",        0) / 100 +
+            (result.get("communication_score", 0) * 10) * w.get("communication", 0) / 100 +
+            (result.get("behavioral_score",    0) * 10) * w.get("behavioral",    0) / 100 +
+            (result.get("confidence_score",    0) * 10) * w.get("confidence",    0) / 100 +
+            ats_sub * w.get("ats", 0) / 100
         )
         result["overall_score"] = max(0, min(100, exact_score))
         logger.info(f"[eval] exact overall_score recalculated: {result['overall_score']}")

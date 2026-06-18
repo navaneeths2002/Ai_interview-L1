@@ -54,3 +54,6 @@ class TriggerInterviewResponse(BaseModel):
     status: str
     join_url: str
     message: str
+    # Role-tuned evaluation weights chosen by the LLM for this interview.
+    # {"role_category", "weights": {jd_fit,communication,behavioral,confidence,ats}, "rationale", "source"}
+    evaluation_weights: dict[str, Any] | None = None

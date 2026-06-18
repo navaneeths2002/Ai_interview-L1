@@ -203,6 +203,12 @@ async def build_interview_context(
         ats_total_score=ats_data["total_score"],
     )
 
+    _weights_doc = strategy.get("evaluation_weights_doc") or {}
+    logger.info(
+        f"[context] role-tuned weights ({_weights_doc.get('source')}, "
+        f"{_weights_doc.get('role_category')}): {_weights_doc.get('weights')}"
+    )
+
     # Step 8 — Create LiveKit room + interview record
     interview_id = str(uuid.uuid4())
     await create_interview_room(interview_id)
@@ -242,6 +248,8 @@ async def build_interview_context(
         experience_to_verify={"claims": strategy.get("experience_to_verify", [])},
         interview_strategy=strategy.get("strategy_summary", ""),
         question_flow={},
+        # Role-tuned evaluation weights (always present + valid — built in strategy_builder)
+        evaluation_weights=strategy.get("evaluation_weights_doc"),
     )
     db.add(context)
 
@@ -263,4 +271,5 @@ async def build_interview_context(
         "candidate_name": f"{candidate.first_name} {candidate.last_name}",
         "missing_skills": ats_data["missing_skills"],
         "strategy_summary": strategy.get("strategy_summary", ""),
+        "evaluation_weights": _weights_doc,
     }

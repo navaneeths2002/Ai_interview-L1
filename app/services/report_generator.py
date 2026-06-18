@@ -122,6 +122,28 @@ def _render_html(d: dict) -> str:
     rec_label, rec_color = _rec_badge(d.get("recommendation"))
     overall    = d.get("overall_score")
 
+    # ── Role-tuned scoring weights (optional — null for pre-feature interviews) ──
+    weights_doc = d.get("evaluation_weights") or {}
+    w           = weights_doc.get("weights") or {}
+    _wlabels    = [("JD Fit", "jd_fit"), ("Communication", "communication"),
+                   ("Behavioral", "behavioral"), ("Confidence", "confidence"), ("ATS", "ats")]
+    weight_chips = "".join(
+        f'<span class="wchip">{lbl} <b>{w.get(key)}%</b></span>'
+        for lbl, key in _wlabels if w.get(key) is not None
+    )
+    role_cat  = (weights_doc.get("role_category") or "").replace("_", " ").title()
+    w_rationale = weights_doc.get("rationale") or ""
+    tuned     = weights_doc.get("source") == "llm"
+    weights_section = ""
+    if weight_chips:
+        weights_section = f"""
+    <div class="section">
+      <div class="section-title">Scoring Weights {'&mdash; role-tuned' if tuned else '(standard)'}</div>
+      <div class="wchips">{weight_chips}</div>
+      {f'<p class="wrole">Role profile: <b>{role_cat}</b></p>' if role_cat else ''}
+      {f'<p class="summary-text" style="margin-top:6px">{w_rationale}</p>' if w_rationale else ''}
+    </div>"""
+
     def score_bar(label: str, val: int | None, key: str) -> str:
         v   = val or 0
         col = _score_colour(val)
@@ -237,6 +259,14 @@ def _render_html(d: dict) -> str:
   .summary-text{{font-size:13px;color:#334155;line-height:1.75;}}
   .muted{{font-size:12.5px;color:#94A3B8;}}
 
+  /* Role-tuned scoring weights */
+  .wchips{{display:flex;flex-wrap:wrap;gap:8px;}}
+  .wchip{{background:#EFF6FF;border:1px solid #DBEAFE;border-radius:7px;
+          padding:6px 12px;font-size:12px;color:#334155;}}
+  .wchip b{{color:#2563EB;font-weight:700;}}
+  .wrole{{font-size:12px;color:#64748B;margin-top:8px;}}
+  .wrole b{{color:#0F172A;}}
+
   /* Footer */
   .footer{{background:#F8FAFC;border-top:1px solid #E2E8F0;padding:14px 36px;
            display:flex;justify-content:space-between;font-size:10.5px;color:#94A3B8;}}
@@ -323,6 +353,7 @@ def _render_html(d: dict) -> str:
       {score_bar("JD Fit",         scores.get("jd_fit"),        "jd_fit")}
       {score_bar("Behavioral",     scores.get("behavioral"),    "behavioral")}
     </div>
+{weights_section}
 
     <!-- Executive summary -->
     <div class="section">
@@ -420,6 +451,11 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         ))
     )).scalar_one_or_none()
 
+    # Interview context — holds the role-tuned evaluation weights
+    context = (await db.execute(
+        select(InterviewContext).where(InterviewContext.interview_id == interview_id)
+    )).scalar_one_or_none()
+
     # Scores (must exist)
     score_row = (await db.execute(
         select(InterviewScore).where(InterviewScore.interview_id == interview_id)
@@ -477,6 +513,7 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
 
         "overall_score":  score_row.overall_score,
         "recommendation": score_row.recommendation,
+        "evaluation_weights": (context.evaluation_weights if context else None),
         "summary":        summary,
         "strengths":      strengths,
         "weaknesses":     weaknesses,
