@@ -148,7 +148,7 @@ Weighting guidance — set evaluation_weights based on what matters MOST for thi
 Return ONLY valid JSON. No explanation outside the JSON.
 """
 
-    raw = _call_with_retry(client, prompt)
+    raw, usage = _call_with_retry(client, prompt)
     if raw is None:
         return _default_strategy(missing_skills)
 
@@ -160,12 +160,18 @@ Return ONLY valid JSON. No explanation outside the JSON.
 
     # Attach the normalized, guardrailed evaluation-weights document (always valid).
     strategy["evaluation_weights_doc"] = _build_weights_doc(strategy)
+    # Token usage for cost tracking (strategy Claude call).
+    strategy["token_usage"] = usage or {"strategy_in": 0, "strategy_out": 0}
 
     return strategy
 
 
-def _call_with_retry(client: anthropic.Anthropic, prompt: str, retries: int = 3) -> str | None:
-    """Calls Claude with exponential backoff on 529/529 overload errors."""
+def _call_with_retry(client: anthropic.Anthropic, prompt: str, retries: int = 3) -> tuple[str | None, dict | None]:
+    """
+    Calls Claude with exponential backoff on 429/529 overload errors.
+    Returns (text, usage) — usage = {"strategy_in", "strategy_out"} token counts,
+    or (None, None) on failure.
+    """
     for attempt in range(retries):
         try:
             message = client.messages.create(
@@ -173,15 +179,19 @@ def _call_with_retry(client: anthropic.Anthropic, prompt: str, retries: int = 3)
                 max_tokens=1024,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return message.content[0].text.strip()
+            usage = {
+                "strategy_in":  getattr(message.usage, "input_tokens", 0),
+                "strategy_out": getattr(message.usage, "output_tokens", 0),
+            }
+            return message.content[0].text.strip(), usage
         except anthropic.APIStatusError as e:
             if e.status_code in (429, 529) and attempt < retries - 1:
                 wait = 2 ** attempt  # 1s, 2s, 4s
                 time.sleep(wait)
                 continue
-            return None
+            return None, None
         except Exception:
-            return None
+            return None, None
 
 
 def _format_experience(experience: list[dict]) -> str:

@@ -27,7 +27,7 @@ _env_path = pathlib.Path(__file__).resolve().parent.parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path, override=False)
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
-from livekit.agents import llm
+from livekit.agents import llm, metrics
 from livekit.agents.voice import room_io
 from livekit.plugins import deepgram, elevenlabs, anthropic, silero, simli
 from livekit.plugins.elevenlabs import VoiceSettings
@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 
 from app.realtime.interview_graph import build_interview_graph, make_initial_state, InterviewState
 from app.realtime import crash_recovery
+from app.services import cost_tracker
 
 
 # ── Base system prompt ─────────────────────────────────────────────────────────
@@ -50,6 +51,12 @@ Rules:
 - Listen carefully and ask natural follow-up questions when needed
 - Do not reveal scoring or internal evaluation
 - When all information is gathered, thank the candidate and close professionally
+
+About the role:
+- You are interviewing for a specific role (see ROLE CONTEXT below, if provided)
+- If the candidate asks about the job, responsibilities, or required skills, answer briefly and naturally using the ROLE CONTEXT — a sentence or two, never read the description out like a document
+- If the candidate asks about salary/compensation/budget, do NOT state any figure — politely deflect: "That's typically discussed in the later rounds." Your job here is to learn THEIR expectation, not share the budget
+- Never invent role details that aren't in the ROLE CONTEXT — if you don't know, say it'll be covered in a later round
 
 Natural behavior (follow these exactly):
 - Occasionally begin responses with natural acknowledgments: "Right,", "I see,", "Got it,", "Sure,", "Okay,", "Absolutely,"
@@ -115,6 +122,7 @@ async def _load_interview_context(interview_id: str, max_retries: int = 4) -> di
         "candidate_name": "the candidate",
         "skills_to_probe": [],
         "gaps_to_probe":  [],
+        "job": {},
     }
     factory = _get_db_factory()
     if not factory:
@@ -127,9 +135,12 @@ async def _load_interview_context(interview_id: str, max_retries: int = 4) -> di
                 row = (await session.execute(
                     text("""
                         SELECT i.tenant_id,
-                               c.first_name || ' ' || COALESCE(c.last_name, '') AS candidate_name
+                               c.first_name || ' ' || COALESCE(c.last_name, '') AS candidate_name,
+                               j.position_title, j.department, j.location,
+                               j.min_experience_years, j.critical_skills, j.jd_text
                         FROM interviews i
                         JOIN candidates c ON c.id = i.candidate_id
+                        LEFT JOIN jobs j ON j.id = i.job_id
                         WHERE i.id = :id
                     """),
                     {"id": interview_id},
@@ -160,9 +171,18 @@ async def _load_interview_context(interview_id: str, max_retries: int = 4) -> di
                     "candidate_name":  candidate_name,
                     "gaps_to_probe":   list(ctx_row[0] or []) if ctx_row else [],
                     "skills_to_probe": list(ctx_row[1] or []) if ctx_row else [],
+                    "job": {
+                        "position_title":       row[2],
+                        "department":           row[3],
+                        "location":             row[4],
+                        "min_experience_years": row[5],
+                        "critical_skills":      list(row[6] or []),
+                        "jd_text":              row[7],
+                    },
                 }
                 logger.info(
-                    f"[context] loaded — tenant={tenant_id} candidate={candidate_name}",
+                    f"[context] loaded — tenant={tenant_id} candidate={candidate_name} "
+                    f"role={row[2] or 'N/A'}",
                     extra={"interview_id": interview_id},
                 )
                 return result
@@ -185,6 +205,45 @@ async def _load_interview_context(interview_id: str, max_retries: int = 4) -> di
                 )
 
     return defaults
+
+
+def _build_job_context(job: dict) -> str:
+    """
+    Build a CONCISE role summary injected into Sarah's prompt so she can answer
+    candidate questions about the job naturally — a few lines, never the full JD.
+    Returns "" when no job is available (Sarah just runs role-agnostic).
+    """
+    if not job or not job.get("position_title"):
+        return ""
+
+    parts: list[str] = []
+    title = job.get("position_title")
+    dept  = job.get("department")
+    loc   = job.get("location")
+    headline = title
+    if dept and loc:
+        headline += f" ({dept}, {loc})"
+    elif dept:
+        headline += f" ({dept})"
+    elif loc:
+        headline += f" ({loc})"
+    parts.append(f"Position: {headline}")
+
+    if job.get("min_experience_years"):
+        parts.append(f"Experience required: {job['min_experience_years']}+ years")
+
+    skills = job.get("critical_skills") or []
+    if skills:
+        parts.append(f"Key skills: {', '.join(skills[:6])}")
+
+    jd = (job.get("jd_text") or "").strip()
+    if jd:
+        # Trim to a couple of sentences so Sarah summarises, not recites.
+        summary = jd[:300].rsplit(".", 1)[0].strip()
+        if summary:
+            parts.append(f"About the role: {summary}.")
+
+    return "\n".join(parts)
 
 
 async def _save_transcript(
@@ -338,26 +397,32 @@ class HRInterviewAgent(Agent):
         graph_state:  InterviewState,
         interview_id: str | None = None,
         tenant_id:    str | None = None,
+        job_context:  str = "",
     ) -> None:
         super().__init__(instructions=BASE_SYSTEM_PROMPT)
         self._graph                          = build_interview_graph()
         self._graph_state: InterviewState    = graph_state
         self.interview_id                    = interview_id
         self.tenant_id                       = tenant_id
+        # Role context (title, key skills, short JD summary) injected into every
+        # LLM call so Sarah knows the job and can answer the candidate's questions.
+        self._job_context                    = job_context or ""
         self._transcript_tasks: set[asyncio.Task] = set()
 
     @property
     def instructions(self) -> str:
+        prompt = BASE_SYSTEM_PROMPT
+        if self._job_context:
+            prompt += "\n\n## ROLE CONTEXT\n" + self._job_context
         stage_instr = self._graph_state.get("stage_instruction", "")
-        if not stage_instr:
-            return BASE_SYSTEM_PROMPT
-        return (
-            BASE_SYSTEM_PROMPT
-            + "\n\n## CURRENT FOCUS\n"
-            + stage_instr
-            + "\n\nFocus your next response on this. "
-            "If the candidate has already answered, acknowledge and pivot cleanly."
-        )
+        if stage_instr:
+            prompt += (
+                "\n\n## CURRENT FOCUS\n"
+                + stage_instr
+                + "\n\nFocus your next response on this. "
+                "If the candidate has already answered, acknowledge and pivot cleanly."
+            )
+        return prompt
 
     def _queue_save(self, speaker: str, text: str, node: str | None = None) -> None:
         if not self.interview_id:
@@ -508,6 +573,12 @@ async def entrypoint(ctx: JobContext):
     candidate_name = ctx_data.get("candidate_name", "the candidate")
     gaps_to_probe  = ctx_data.get("gaps_to_probe",  [])
     skills_to_probe = ctx_data.get("skills_to_probe", [])
+    job_context    = _build_job_context(ctx_data.get("job") or {})
+    if job_context:
+        logger.info(
+            f"[context] role loaded: {(ctx_data.get('job') or {}).get('position_title')}",
+            extra={"interview_id": interview_id},
+        )
 
     if not tenant_id:
         logger.error(
@@ -547,6 +618,10 @@ async def entrypoint(ctx: JobContext):
     # Strong refs to fire-and-forget tasks — an unreferenced asyncio task can be
     # garbage-collected before it runs (e.g. the re-greet vanishing mid-sleep)
     _pending_tasks: set[asyncio.Task] = set()
+
+    # Aggregates real LLM/STT/TTS usage across the whole session for cost tracking.
+    # Fed by the "metrics_collected" event; read in on_shutdown to compute cost.
+    usage_collector = metrics.UsageCollector()
 
     # ── Avatar lifecycle (Simli) ──────────────────────────────────────────────
     # Held in a list so the reconnect handler (registered before the avatar
@@ -652,6 +727,7 @@ async def entrypoint(ctx: JobContext):
         graph_state=graph_state,
         interview_id=interview_id,
         tenant_id=tenant_id,
+        job_context=job_context,
     )
 
     # ── Shutdown callback ──────────────────────────────────────────────────────
@@ -688,6 +764,25 @@ async def entrypoint(ctx: JobContext):
                 logger.error(
                     "Post-interview evaluation failed",
                     extra={"interview_id": interview_id, "error": str(e)},
+                )
+
+            # ── Per-interview cost: record live usage → finalize → log to terminal ──
+            # Runs LAST so conversation + strategy + eval usage are all present.
+            try:
+                s = usage_collector.get_summary()
+                await cost_tracker.patch_usage(interview_id, tenant_id, {
+                    "llm_in":           getattr(s, "llm_input_tokens", 0) or 0,
+                    "llm_out":          getattr(s, "llm_output_tokens", 0) or 0,
+                    "tts_chars":        getattr(s, "tts_characters_count", 0) or 0,
+                    "stt_seconds":      round(getattr(s, "stt_audio_duration", 0) or 0, 1),
+                    "duration_seconds": duration or 0,
+                    "avatar_seconds":   (duration or 0) if avatar_active else 0,
+                })
+                await cost_tracker.finalize_and_log(interview_id)
+            except Exception as e:
+                logger.warning(
+                    f"[cost] finalize in shutdown failed (non-fatal): {e}",
+                    extra={"interview_id": interview_id},
                 )
 
     ctx.add_shutdown_callback(on_shutdown)
@@ -870,6 +965,16 @@ async def entrypoint(ctx: JobContext):
     # CRASH RECOVERY HOOK: let the reconnect handler reach the session for re-greeting
     _session_holder.append(session)
 
+    # ── COST TRACKING: aggregate real LLM/STT/TTS usage across the session ──────
+    # The SDK emits one metrics event per model step; UsageCollector sums tokens,
+    # TTS characters, and STT audio duration. Read in on_shutdown to compute cost.
+    @session.on("metrics_collected")
+    def _on_metrics(ev) -> None:
+        try:
+            usage_collector.collect(ev.metrics)
+        except Exception:
+            pass  # usage aggregation must never disturb the live pipeline
+
     # ── Avatar via OFFICIAL livekit-plugins-simli (must start BEFORE session) ──
     # The official plugin dispatches the avatar as a SEPARATE LiveKit worker that
     # renders video + republishes audio. It does NOT run on this event loop, so
@@ -962,9 +1067,15 @@ async def entrypoint(ctx: JobContext):
             candidate_name, graph_state.get("stage", "intro")
         )
     else:
+        _role = (ctx_data.get("job") or {}).get("position_title")
+        _role_line = (
+            f"Briefly mention this screening is for the {_role} position. "
+            if _role else ""
+        )
         greeting = (
             "Greet the candidate warmly. Welcome them to their screening interview. "
             f"Their name is {candidate_name}. "
+            + _role_line +
             "Mention that the session will be recorded and ask for their consent to proceed. "
             "Be natural and friendly — like a real HR person starting a call."
         )

@@ -18,6 +18,7 @@ from app.services.resume_extractor import extract_resume_data
 from app.services.ats_extractor import extract_ats_data
 from app.services.strategy_builder import build_interview_strategy
 from app.services.email_service import send_interview_invite
+from app.services import cost_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,13 @@ async def build_interview_context(
     db.add(context)
 
     await db.flush()
+
+    # Record the strategy Claude call's token usage for per-interview cost tracking.
+    _tu = strategy.get("token_usage") or {}
+    asyncio.create_task(cost_tracker.patch_usage(interview_id, tenant_id, {
+        "strategy_in":  _tu.get("strategy_in", 0),
+        "strategy_out": _tu.get("strategy_out", 0),
+    }))
 
     # Send invite email to candidate (fire-and-forget — never blocks the API response)
     asyncio.create_task(send_interview_invite(

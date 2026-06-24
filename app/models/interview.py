@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Boolean, Text, DateTime
+from sqlalchemy import String, Integer, Boolean, Text, DateTime, Float
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -152,3 +152,24 @@ class InterviewScore(BaseModel):
     override_reason: Mapped[str] = mapped_column(Text, nullable=True)
     override_by: Mapped[str] = mapped_column(String(36), nullable=True)
     override_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InterviewCost(BaseModel):
+    """
+    Real (measured) marginal cost of one interview — written incrementally by
+    three sources and finalized at interview end:
+
+      • trigger      → strategy Claude tokens
+      • interview    → conversation LLM tokens, TTS chars, STT seconds, duration, avatar
+      • evaluation   → evaluation Claude tokens
+
+    `usage` is a merged JSONB document (see app/services/pricing.compute_cost for
+    the keys). `cost` is the per-tool breakdown; `total_usd` is the sum.
+    """
+    __tablename__ = "interview_costs"
+
+    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
+
+    usage: Mapped[dict] = mapped_column(JSONB, nullable=True)   # merged raw usage
+    cost:  Mapped[dict] = mapped_column(JSONB, nullable=True)   # per-tool USD breakdown
+    total_usd: Mapped[float] = mapped_column(Float, nullable=True)

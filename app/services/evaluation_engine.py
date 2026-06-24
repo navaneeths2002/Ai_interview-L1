@@ -391,6 +391,7 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
     _backoff_seconds = [2, 4, 8]
     raw: str = ""
 
+    eval_usage = {"eval_in": 0, "eval_out": 0}
     for attempt in range(1, _max_attempts + 1):
         try:
             response = await client.messages.create(
@@ -400,6 +401,10 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
                 messages=[{"role": "user", "content": user_prompt}],
             )
             raw = response.content[0].text
+            eval_usage = {
+                "eval_in":  getattr(response.usage, "input_tokens", 0),
+                "eval_out": getattr(response.usage, "output_tokens", 0),
+            }
             break  # success
         except _retryable as exc:
             if attempt < _max_attempts:
@@ -456,6 +461,10 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
 
     # ── 11. Save to DB ─────────────────────────────────────────────────────────
     await _save_results(db, interview, result)
+
+    # Record evaluation Claude token usage for per-interview cost tracking.
+    from app.services import cost_tracker
+    await cost_tracker.patch_usage(interview_id, str(interview.tenant_id), eval_usage)
 
     logger.info(
         f"[eval] ✓ {interview_id} | "
