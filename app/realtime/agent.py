@@ -29,14 +29,14 @@ load_dotenv(dotenv_path=_env_path, override=False)
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.agents import llm, metrics
 from livekit.agents.voice import room_io
-from livekit.plugins import deepgram, elevenlabs, anthropic, silero, simli
-from livekit.plugins.elevenlabs import VoiceSettings
+from livekit.plugins import deepgram, anthropic, silero, simli
 from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.realtime.interview_graph import build_interview_graph, make_initial_state, InterviewState
 from app.realtime import crash_recovery
+from app.realtime import audio_capture
 from app.services import cost_tracker
 
 
@@ -641,8 +641,16 @@ async def entrypoint(ctx: JobContext):
     # HEARS her (the face just won't animate). Safety net — toggle for testing
     # and future use. Default on.
     avatar_fallback_enabled = os.environ.get("AVATAR_FALLBACK_TO_ROOM_AUDIO", "true").strip().lower() not in ("false", "0", "no")
+    # AVATAR_WATCHDOG_ENABLED=true → probe avatar health mid-interview and
+    # self-heal (restart once, then room-audio fallback) instead of waiting
+    # for a candidate reconnect to fix a dead avatar.
+    watchdog_enabled = os.environ.get("AVATAR_WATCHDOG_ENABLED", "true").strip().lower() not in ("false", "0", "no")
     simli_api_key = os.environ.get("SIMLI_API_KEY", "")
     simli_face_id = os.environ.get("SIMLI_FACE_ID", "")
+
+    # Mutable avatar state — the watchdog / heal path flips "active" mid-stream.
+    # "restarts" budgets mid-stream restarts (reconnect restarts are unbudgeted).
+    avatar_state = {"active": False, "restarts": 0}
 
     async def _start_avatar() -> bool:
         """Create + start a FRESH Simli AvatarSession bound to the live session.
@@ -718,6 +726,91 @@ async def entrypoint(ctx: JobContext):
                 extra={"interview_id": interview_id},
             )
 
+    # ── AVATAR WATCHDOG: mid-stream self-heal (not just on reconnect) ─────────
+    # Failure covered: the agent→Simli pipe dies DURING the interview (Simli
+    # worker crash / publisher connection timeout). All voice routes through
+    # the avatar participant, so the candidate silently stops hearing Sarah.
+    # The watchdog probes health every few seconds while the candidate is
+    # connected; on failure it restarts the avatar once, then falls back to
+    # room audio permanently. Logic lives in crash_recovery.AvatarWatchdog —
+    # these are the thin hooks it needs.
+    _avatar_heal_lock = asyncio.Lock()
+
+    def _candidate_in_room() -> bool:
+        try:
+            return any(
+                str(getattr(p, "identity", "")).startswith("candidate-")
+                for p in ctx.room.remote_participants.values()
+            )
+        except Exception:
+            return False
+
+    def _avatar_alive() -> bool:
+        """Cheap sync health probe — no awaits, safe to call every few seconds."""
+        if not avatar_state["active"] or not _avatar_holder:
+            return False
+        # 1) The simli-avatar participant must still be in the room
+        try:
+            if not any(
+                str(getattr(p, "identity", "")) == "simli-avatar"
+                for p in ctx.room.remote_participants.values()
+            ):
+                return False
+        except Exception:
+            pass  # can't read participants — don't false-alarm
+        # 2) No internal task of the avatar session / audio pipe died with an
+        #    error (catches the frozen-pipe case where the participant stays).
+        try:
+            if crash_recovery.has_dead_task(_avatar_holder[0]):
+                return False
+            if _session_holder:
+                out = getattr(_session_holder[0].output, "audio", None)
+                if out is not None and crash_recovery.has_dead_task(out):
+                    return False
+        except Exception:
+            pass
+        return True
+
+    async def _heal_avatar() -> None:
+        """Restart the avatar once mid-stream; afterwards (or if the restart
+        fails) fall back to room audio so the candidate keeps hearing Sarah.
+        Idempotent — concurrent triggers (probe + fast path) collapse to one."""
+        if _avatar_heal_lock.locked():
+            return
+        async with _avatar_heal_lock:
+            if not avatar_state["active"]:
+                return  # already healed / voice-only
+            logger.warning(
+                "[avatar-watchdog] avatar unhealthy mid-interview — self-healing",
+                extra={"interview_id": interview_id},
+            )
+            restarted = False
+            if avatar_state["restarts"] < 1:  # one live restart, then permanent fallback
+                avatar_state["restarts"] += 1
+                restarted = await _start_avatar()
+            if restarted:
+                avatar_watchdog.avatar_started()
+                logger.info(
+                    "[avatar-watchdog] avatar restarted mid-stream ✓",
+                    extra={"interview_id": interview_id},
+                )
+            else:
+                avatar_state["active"] = False
+                avatar_watchdog.stop()
+                await _fallback_to_room_audio()
+                logger.warning(
+                    "[avatar-watchdog] avatar could not be restarted — voice "
+                    "continues via room audio (face disabled)",
+                    extra={"interview_id": interview_id},
+                )
+
+    avatar_watchdog = crash_recovery.AvatarWatchdog(
+        is_avatar_alive=_avatar_alive,
+        is_candidate_present=_candidate_in_room,
+        on_failure=_heal_avatar,
+        interview_id=interview_id,
+    )
+
     # ── FIX 4: Create hr_agent BEFORE on_shutdown ─────────────────────────────
     # Previously hr_agent was created AFTER on_shutdown was defined and
     # registered. If shutdown fired before hr_agent was assigned, the closure
@@ -730,8 +823,14 @@ async def entrypoint(ctx: JobContext):
         job_context=job_context,
     )
 
+    # ── VOICE CAPTURE HOOK: record the candidate's audio to a local WAV so the
+    # post-interview voice-analysis engine can score delivery for voice-heavy
+    # roles. Fully isolated (audio_capture.py); every failure is swallowed.
+    recorder = audio_capture.CandidateAudioRecorder(interview_id)
+
     # ── Shutdown callback ──────────────────────────────────────────────────────
     async def on_shutdown() -> None:
+        avatar_watchdog.stop()
         if interview_id and tenant_id:
             end_time = datetime.now(timezone.utc)
             start    = interview_start_time[0]
@@ -752,6 +851,33 @@ async def entrypoint(ctx: JobContext):
                     extra={"interview_id": interview_id},
                 )
                 await asyncio.gather(*pending_saves, return_exceptions=True)
+
+            # ── VOICE CAPTURE HOOK: stop recording + persist the local WAV path
+            # to interviews.recording_s3_key BEFORE evaluation, so voice_analysis
+            # (invoked inside run_evaluation) can read it. Non-fatal on any error.
+            try:
+                rec_path = await recorder.stop()
+                if rec_path:
+                    factory = _get_db_factory()
+                    if factory:
+                        async with factory() as session:
+                            await session.execute(
+                                text(
+                                    "UPDATE interviews SET recording_s3_key = :p, "
+                                    "updated_at = :now WHERE id = :id"
+                                ),
+                                {"p": rec_path, "now": datetime.now(timezone.utc), "id": interview_id},
+                            )
+                            await session.commit()
+                        logger.info(
+                            f"[audio-capture] recording path saved: {rec_path}",
+                            extra={"interview_id": interview_id},
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[audio-capture] stop/persist failed (non-fatal): {e}",
+                    extra={"interview_id": interview_id},
+                )
 
             try:
                 from app.services.evaluation_engine import run_evaluation
@@ -795,6 +921,23 @@ async def entrypoint(ctx: JobContext):
             f"participant={participant.identity}",
             extra={"interview_id": interview_id},
         )
+        # VOICE CAPTURE HOOK: start recording the candidate's audio track.
+        # In this SDK, track.kind is an INTEGER enum (1 = audio, 2 = video) that
+        # stringifies to a number — the logs show "kind=1" for candidate audio.
+        # Match the enum value (with an int fallback), NOT a "audio" string.
+        try:
+            from livekit import rtc as _rtc
+            _audio_kind = _rtc.TrackKind.KIND_AUDIO
+        except Exception:
+            _audio_kind = 1
+        _tk = getattr(track, "kind", None)
+        _is_audio = (_tk == _audio_kind) or (_tk == 1)
+        if _is_audio and str(getattr(participant, "identity", "")).startswith("candidate-"):
+            logger.info(
+                "[audio-capture] candidate audio track detected — starting recorder",
+                extra={"interview_id": interview_id},
+            )
+            recorder.start(track)
 
     @ctx.room.on("track_published")
     def on_track_published(publication, participant) -> None:
@@ -876,8 +1019,14 @@ async def entrypoint(ctx: JobContext):
                 # Re-link the audio pipe first.
                 if avatar_enabled:
                     restarted = await _start_avatar()
-                    if not restarted:
+                    avatar_state["active"] = restarted
+                    if restarted:
+                        if watchdog_enabled:
+                            avatar_watchdog.avatar_started()
+                            avatar_watchdog.start()
+                    else:
                         # Avatar couldn't come back — keep the candidate in audio.
+                        avatar_watchdog.stop()
                         await _fallback_to_room_audio()
                     # Let the fresh avatar (or room track) settle before speaking.
                     await asyncio.sleep(1.5)
@@ -914,6 +1063,11 @@ async def entrypoint(ctx: JobContext):
     def on_participant_disconnected(participant) -> None:
         # Only react to the candidate leaving — ignore avatar/other agents
         if participant.identity == "simli-avatar":
+            # AVATAR WATCHDOG fast path: the avatar dropping while the candidate
+            # is still here is a mid-stream failure — heal now, don't wait for
+            # the next probe. (No-op if the candidate left first: that teardown
+            # is expected, and the reconnect path owns the restart.)
+            avatar_watchdog.notify_avatar_left()
             return
         if not participant.identity.startswith("candidate-"):
             return
@@ -926,9 +1080,13 @@ async def entrypoint(ctx: JobContext):
     # ── AgentSession ──────────────────────────────────────────────────────────
     session = AgentSession(
         vad=silero.VAD.load(
-            min_speech_duration=0.05,       # 50ms — detect short utterances
+            # Lever A — barge-in rate control. The old 50ms / 0.1 settings were so
+            # sensitive that breaths, clicks, and (worst) Sarah's own echo from the
+            # avatar registered as speech, each firing a false barge-in. Raised to
+            # filter noise/echo while still catching a genuinely quiet candidate.
+            min_speech_duration=0.20,       # 200ms — ignore clicks/breaths/short echo blips
             min_silence_duration=0.5,
-            activation_threshold=0.1,       # very sensitive — catches quiet/degraded audio
+            activation_threshold=0.40,      # less sensitive — noise/echo no longer trips it
             prefix_padding_duration=0.3,
         ),
         stt=deepgram.STT(
@@ -945,19 +1103,16 @@ async def entrypoint(ctx: JobContext):
             model="claude-haiku-4-5-20251001",
             api_key=os.environ["ANTHROPIC_API_KEY"],
         ),
-        tts=elevenlabs.TTS(
-            api_key=os.environ["ELEVENLABS_API_KEY"],
-            voice_id="EXAVITQu4vr4xnSDxMaL",  # Sarah
-            model="eleven_turbo_v2_5",
-            voice_settings=VoiceSettings(
-                stability=0.45,
-                similarity_boost=0.80,
-                style=0.35,
-                speed=0.95,
-            ),
+        tts=deepgram.TTS(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            model="aura-2-vesta-en",   # Sarah — warm female Aura-2 voice
+            sample_rate=24000,          # matches the room-audio fallback path
         ),
         allow_interruptions=True,
-        min_interruption_words=4,
+        # Lever A — require more real words before a barge-in stops Sarah mid-sentence.
+        # 4 words let a stray "uh, okay yeah right" (or an echo fragment) cut her off;
+        # 6 means it takes a deliberate utterance to interrupt.
+        min_interruption_words=6,
         min_endpointing_delay=0.4,
         max_endpointing_delay=6.0,
         aec_warmup_duration=0,
@@ -985,6 +1140,12 @@ async def entrypoint(ctx: JobContext):
     if not avatar_enabled:
         logger.info("AVATAR_ENABLED=false — voice-only mode (reliable)", extra={"interview_id": interview_id})
     avatar_active = await _start_avatar()
+    avatar_state["active"] = avatar_active
+    if avatar_active and watchdog_enabled:
+        # AVATAR WATCHDOG: begin mid-stream health probing (self-heals a dead
+        # avatar live instead of waiting for a candidate reconnect).
+        avatar_watchdog.avatar_started()
+        avatar_watchdog.start()
     if avatar_enabled and not avatar_active:
         logger.info(
             "[avatar] not active at startup — voice-only via room audio",

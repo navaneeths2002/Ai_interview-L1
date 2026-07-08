@@ -127,15 +127,15 @@ async def finalize_and_log(interview_id: str | None) -> dict | None:
 
 def _log_breakdown(interview_id: str, usage: dict, cost: dict) -> None:
     """Print a readable cost breakdown to the terminal at interview end."""
-    tok_in  = sum(float(usage.get(k) or 0) for k in ("llm_in", "eval_in", "strategy_in"))
-    tok_out = sum(float(usage.get(k) or 0) for k in ("llm_out", "eval_out", "strategy_out"))
+    tok_in  = sum(float(usage.get(k) or 0) for k in ("llm_in", "eval_in", "strategy_in", "voice_in"))
+    tok_out = sum(float(usage.get(k) or 0) for k in ("llm_out", "eval_out", "strategy_out", "voice_out"))
     dur     = float(usage.get("duration_seconds") or 0)
     logger.info(
         "[cost] ====== INTERVIEW COST ======\n"
         f"        interview : {interview_id}\n"
         f"        duration  : {dur/60:.1f} min\n"
         f"        Claude    : ${cost['claude']:.4f}  ({tok_in:,.0f} in / {tok_out:,.0f} out tokens)\n"
-        f"        ElevenLabs: ${cost['elevenlabs']:.4f}  ({float(usage.get('tts_chars') or 0):,.0f} chars)\n"
+        f"        TTS(Aura-2): ${cost['elevenlabs']:.4f}  ({float(usage.get('tts_chars') or 0):,.0f} chars)\n"
         f"        Deepgram  : ${cost['deepgram']:.4f}  ({float(usage.get('stt_seconds') or 0):,.0f} s)\n"
         f"        LiveKit   : ${cost['livekit']:.4f}\n"
         f"        Simli     : ${cost['simli']:.4f}  ({float(usage.get('avatar_seconds') or 0)/60:.1f} min)\n"

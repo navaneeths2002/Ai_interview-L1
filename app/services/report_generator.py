@@ -173,6 +173,56 @@ def _render_html(d: dict) -> str:
           <div class="hl-a"><span class="hl-tag ca-tag">Candidate</span>{a}</div>
         </div>"""
 
+    # ── Voice & Delivery Analysis (optional — only for voice-weighted roles) ──
+    voice = d.get("voice_analysis") or {}
+    voice_section = ""
+    if voice and (voice.get("narrative") or voice.get("features")):
+        vf    = voice.get("features", {}) or {}
+        blend = voice.get("blend", {}) or {}
+
+        def _vcell(label: str, val: str) -> str:
+            return f'<div class="data-cell"><label>{label}</label><span>{val}</span></div>'
+
+        _delivery = voice.get("delivery_score")
+        _hes = vf.get("within_pause_ratio")
+        _metrics = "".join([
+            _vcell("Delivery Score", f"{_delivery}/10" if _delivery is not None else "—"),
+            _vcell("Speaking Pace", f"{vf.get('pace_wpm')} wpm" if vf.get("pace_wpm") is not None else "—"),
+            _vcell("Expressiveness", f"{vf.get('pitch_std_hz')} Hz var" if vf.get("pitch_std_hz") is not None else "—"),
+            _vcell("Voice Clarity", f"{vf.get('hnr_db')} dB HNR" if vf.get("hnr_db") is not None else "—"),
+            _vcell("Hesitation", f"{round(_hes * 100)}%" if _hes is not None else "—"),
+            _vcell("Filler Rate", f"{vf.get('filler_per_100w')} /100w" if vf.get("filler_per_100w") is not None else "—"),
+        ])
+
+        _blend_note = ""
+        if blend:
+            _vw = int(round(blend.get("voice_weight", 0) * 100))
+            _blend_note = (
+                f'<p class="muted" style="margin-top:10px">Vocal delivery blended into scores '
+                f'(voice weight {_vw}%): Communication {blend.get("text_communication")}&rarr;'
+                f'<b>{blend.get("blended_communication")}</b>, Confidence '
+                f'{blend.get("text_confidence")}&rarr;<b>{blend.get("blended_confidence")}</b>.</p>'
+            )
+
+        voice_section = f"""
+    <div class="section">
+      <div class="section-title">Voice &amp; Delivery Analysis</div>
+      <p class="summary-text">{voice.get("narrative") or "Acoustic analysis of the candidate's vocal delivery."}</p>
+      <div class="data-grid" style="margin-top:14px">{_metrics}</div>
+      <div class="grid2" style="margin-top:16px">
+        <div>
+          <div style="font-size:11.5px;font-weight:600;color:#2563EB;margin-bottom:8px;">Delivery Strengths</div>
+          {bullet_list(voice.get("strengths", []) or [], '#2563EB')}
+        </div>
+        <div>
+          <div style="font-size:11.5px;font-weight:600;color:#EAB308;margin-bottom:8px;">Delivery Concerns</div>
+          {bullet_list(voice.get("concerns", []) or [], '#EAB308')}
+        </div>
+      </div>
+      {_blend_note}
+      <p class="muted" style="margin-top:8px;font-size:11px">Objective acoustic measurements, advisory only — interpret alongside the transcript; accents and audio quality can affect readings.</p>
+    </div>"""
+
     gen_at  = d.get("generated_at", "")
     dur_sec = d.get("duration_seconds")
     dur_str = f"{dur_sec // 60}m {dur_sec % 60}s" if dur_sec else "—"
@@ -354,6 +404,7 @@ def _render_html(d: dict) -> str:
       {score_bar("Behavioral",     scores.get("behavioral"),    "behavioral")}
     </div>
 {weights_section}
+{voice_section}
 
     <!-- Executive summary -->
     <div class="section">
@@ -514,6 +565,8 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         "overall_score":  score_row.overall_score,
         "recommendation": score_row.recommendation,
         "evaluation_weights": (context.evaluation_weights if context else None),
+        # Voice & delivery analysis (only present for voice-weighted roles with audio)
+        "voice_analysis": raw.get("voice_analysis"),
         "summary":        summary,
         "strengths":      strengths,
         "weaknesses":     weaknesses,

@@ -409,6 +409,27 @@ Agent worker crashes mid-interview
 
 ---
 
+## Voice Reliability + Candidate Readiness (Phase 12)
+
+**1. AvatarWatchdog — mid-stream self-heal** (`app/realtime/crash_recovery.py` → `AvatarWatchdog`, hooks in `agent.py`)
+Previously a dead avatar (Simli worker crash / `publisher connection timeout`) only healed when the candidate reconnected. Now a watchdog probes every 5s while the candidate is connected:
+- Health probe: `simli-avatar` participant still in room + no internal asyncio task (avatar session / `session.output.audio`) died with an exception (`has_dead_task()`).
+- 2 consecutive failed probes (or the fast path — `simli-avatar` disconnecting while the candidate is present) → heal: **one** mid-stream avatar restart; if that fails (or already used) → permanent `_fallback_to_room_audio()`. Voice never stays silently dead.
+- Probes pause while the candidate is away (avatar teardown on candidate disconnect is expected) and for a 15s settle window after every avatar start.
+- Client side: if the avatar video track drops, `interview.html` re-shows the plasma orb instead of a frozen frame; a restarted avatar re-attaches automatically.
+- Toggle: `AVATAR_WATCHDOG_ENABLED=true` (default on). Heal is idempotent (`_avatar_heal_lock`).
+
+**2. Pre-interview readiness modal** (`interview.html`)
+Clicking **Start Interview** now opens a readiness check before joining (Rejoin skips it — the 60s grace window is ticking):
+- Explains what the interview is (Sarah, ~15–30 min, topics, recorded) + basic guidelines.
+- **Secure connection check** — `window.isSecureContext` + `getUserMedia` + `RTCPeerConnection`; catches the http://-page-blocks-mic failure with a clear message.
+- **Network check** — timed `fetch('/health')`; PASSED < 400ms, SLOW above, FAILED if unreachable.
+- **Microphone check** — `getUserMedia` + live level meter; passes when voice is actually detected; Retry button on permission denial. Test stream is fully released before LiveKit captures the mic.
+- **Speaker check** — three-note WebAudio chime + "Yes, I heard it" confirmation (output can't be verified programmatically).
+- **Join Interview** enables only when all four pass; a "Join anyway" escape hatch appears on any failure (candidate can type answers).
+
+---
+
 ## Environment Variables (.env)
 
 ```env
@@ -441,6 +462,7 @@ SIMLI_API_KEY=...
 SIMLI_FACE_ID=...
 AVATAR_ENABLED=true                   # set false → reliable voice-only mode (no avatar single-point-of-failure)
 AVATAR_FALLBACK_TO_ROOM_AUDIO=true    # if avatar can't (re)start, route Sarah's voice via room audio so she's still heard
+AVATAR_WATCHDOG_ENABLED=true          # Phase 12 — probe avatar health mid-interview; self-heal (restart once → room-audio fallback)
 
 # AWS (S3)
 AWS_ACCESS_KEY_ID=...
@@ -534,6 +556,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 10.6 | ✅ Done | Weighted evaluation — JD Fit 35 / Comm 25 / Behav 15 / Conf 15 / ATS 10, exact in-code calculation |
 | 10.7 | ✅ Done | Signed report token — HTML report URL requires ?token= (7-day expiry) |
 | 11 | ✅ Done | In-interview crash recovery — 60s grace timer, stage persistence, "Welcome back" resume |
+| 12 | ✅ Done | Voice reliability + candidate readiness — AvatarWatchdog (mid-stream self-heal) + pre-interview readiness modal (guidelines, mic/speaker/network/HTTPS check) |
 
 ---
 
@@ -556,7 +579,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 - **Two processes required:** FastAPI server + agent worker must both be running.
 - **Simli is optional:** If `SIMLI_API_KEY` or `SIMLI_FACE_ID` is missing (or `avatar.start()` fails), avatar is silently disabled — voice-only mode with room audio output re-enabled.
 - **Avatar must use the official plugin:** `livekit-plugins-simli`. The custom in-process bridge (`avatar_session.py`) starved the event loop and broke mic input — do not revert to it.
-- **Avatar is a voice single-point-of-failure:** when active, ALL of Sarah's audio is routed through the Simli worker (`audio_output=(not avatar_active)`). If a network blip kills the agent→avatar audio pipe (`_audio_forwarding_task` crashes with `publisher connection timeout`), the avatar freezes and the candidate gets text but NO voice. Mitigations now in place: (a) on reconnect the avatar is **restarted** (`_start_avatar()`), (b) `AVATAR_FALLBACK_TO_ROOM_AUDIO=true` re-routes voice to a room track if the restart fails, (c) `AVATAR_ENABLED=false` disables the avatar entirely for guaranteed-reliable voice-only operation on bad networks.
+- **Avatar is a voice single-point-of-failure:** when active, ALL of Sarah's audio is routed through the Simli worker (`audio_output=(not avatar_active)`). If a network blip kills the agent→avatar audio pipe (`_audio_forwarding_task` crashes with `publisher connection timeout`), the avatar freezes and the candidate gets text but NO voice. Mitigations now in place: (a) on reconnect the avatar is **restarted** (`_start_avatar()`), (b) `AVATAR_FALLBACK_TO_ROOM_AUDIO=true` re-routes voice to a room track if the restart fails, (c) `AVATAR_ENABLED=false` disables the avatar entirely for guaranteed-reliable voice-only operation on bad networks, (d) **AvatarWatchdog (Phase 12)** — `AVATAR_WATCHDOG_ENABLED=true` probes avatar health every 5s **mid-interview** (participant presence + dead internal task scan) and self-heals live: one avatar restart, then permanent room-audio fallback — no candidate reconnect needed.
 - **Avatar + corporate WiFi:** the `publisher connection timeout` failures originate on the **agent worker's** connection to LiveKit Cloud, not the candidate's. Running the worker on a stable network (mobile hotspot / EC2) makes the avatar reliable; it was the corporate WiFi all along (same root cause as the browser needing `iceTransportPolicy: "relay"`).
 - **Model on account:** Only `claude-haiku-4-5-20251001` confirmed available. `claude-3-5-sonnet` and `claude-sonnet-4-5-20251001` are NOT on this account.
 - **Room max_participants = 3:** Agent + candidate + simli-avatar. Do not lower this. `empty_timeout=30s`.

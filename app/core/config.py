@@ -6,6 +6,10 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        # .env also carries operational toggles consumed directly via os.environ
+        # (voice capture/analysis, avatar watchdog, recordings dir, etc.) that are
+        # intentionally NOT typed here. Ignore them instead of rejecting startup.
+        extra="ignore",
     )
 
     # Application
@@ -30,6 +34,11 @@ class Settings(BaseSettings):
     ats_base_url: str = ""
     ats_service_token: str = ""
 
+    # ── ATS Integration (direct DB pull + push trigger) ──────────────────────
+    # Read-only connection string to the ATS module's Postgres (a SEPARATE db).
+    # Same NullPool style as the main engine — see app/services/ats_connector.py.
+    ats_database_url: str = ""
+
     # AI Models
     anthropic_api_key: str = ""
     openai_api_key: str = ""
@@ -46,6 +55,7 @@ class Settings(BaseSettings):
     simli_face_id: str = ""
     avatar_enabled: bool = True  # false → reliable voice-only mode (no avatar single-point-of-failure)
     avatar_fallback_to_room_audio: bool = True  # if avatar can't (re)start, route voice via room audio
+    avatar_watchdog_enabled: bool = True  # probe avatar health mid-interview; self-heal (restart → room-audio fallback)
 
     # Email
     smtp_host: str = "smtp.gmail.com"

@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.core.logging_config import setup_logging, get_logger
 from app.core.middleware import TenantMiddleware
 from app.core.rate_limiter import limiter
-from app.api.v1.routes import health, interviews, session, evaluation, reports, recovery
+from app.api.v1.routes import health, interviews, session, evaluation, reports, recovery, integration
 from app.services.recovery import run_all_recovery
 from app.workers.scheduler import start_scheduler, stop_scheduler
 
@@ -76,6 +76,7 @@ app.include_router(session.router,     prefix="/api/v1", tags=["Session"])
 app.include_router(evaluation.router,  prefix="/api/v1", tags=["Evaluation"])
 app.include_router(reports.router,     prefix="/api/v1", tags=["Reports"])
 app.include_router(recovery.router,    prefix="/api/v1", tags=["Recovery"])
+app.include_router(integration.router, prefix="/api/v1", tags=["Integration"])
 
 
 # ── Exception handlers ─────────────────────────────────────────────────────────

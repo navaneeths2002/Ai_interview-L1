@@ -26,6 +26,7 @@ from app.services.recovery import (
     retry_missing_reports,
     expire_abandoned_interviews,
 )
+from app.realtime.audio_capture import cleanup_old_recordings
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,22 @@ scheduler.add_job(
     coalesce=True,
 )
 
+scheduler.add_job(
+    cleanup_old_recordings,
+    trigger=IntervalTrigger(hours=6),
+    id="cleanup_old_recordings",
+    name="Delete candidate audio recordings past the retention window",
+    replace_existing=True,
+    misfire_grace_time=600,
+    coalesce=True,
+)
+
 
 def start_scheduler() -> None:
     """Start the background scheduler. Safe to call multiple times."""
     if not scheduler.running:
         scheduler.start()
-        logger.info("[scheduler] started (4 recovery jobs registered)")
+        logger.info("[scheduler] started (5 periodic jobs registered)")
     else:
         logger.warning("[scheduler] start_scheduler called but scheduler already running")
 

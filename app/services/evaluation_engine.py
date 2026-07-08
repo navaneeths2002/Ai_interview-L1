@@ -46,6 +46,16 @@ EVAL_MODEL = "claude-haiku-4-5-20251001"
 # or LLM failure at trigger). Mirrors strategy_builder's defaults. Sum = 100.
 DEFAULT_WEIGHTS = {"jd_fit": 35, "communication": 25, "behavioral": 15, "confidence": 15, "ats": 10}
 
+# ── Voice & delivery analysis gating ─────────────────────────────────────────────
+# Only run acoustic voice analysis when the ROLE genuinely values how the
+# candidate sounds — i.e. the role rubric weighted communication / behavioral /
+# confidence at/above VOICE_MIN_WEIGHT %. A backend-dev role (jd_fit heavy) won't
+# trigger it; a sales / tele-caller / support role will. All env-tunable.
+VOICE_ANALYSIS_ENABLED = os.environ.get(
+    "VOICE_ANALYSIS_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+VOICE_MIN_WEIGHT = int(os.environ.get("VOICE_ANALYSIS_MIN_WEIGHT", "30"))
+VOICE_BLEND = float(os.environ.get("VOICE_ANALYSIS_BLEND", "0.5"))  # voice share of blended score
+
 # ── System prompt ──────────────────────────────────────────────────────────────
 
 EVALUATION_SYSTEM_PROMPT = """\
@@ -299,6 +309,88 @@ async def _save_results(
     await db.commit()
 
 
+# ── Voice & delivery analysis (role-gated) ───────────────────────────────────────
+
+def _voice_gate_open(weights: dict) -> bool:
+    """True if the role weights make vocal delivery matter enough to analyze."""
+    return any(
+        (weights or {}).get(k, 0) >= VOICE_MIN_WEIGHT
+        for k in ("communication", "behavioral", "confidence")
+    )
+
+
+def _blend_score(text_score, voice_score) -> int | None:
+    """Blend a 1-10 text score with a 1-10 voice score (VOICE_BLEND = voice share)."""
+    if text_score is None or voice_score is None:
+        return text_score
+    blended = text_score * (1 - VOICE_BLEND) + voice_score * VOICE_BLEND
+    return max(1, min(10, round(blended)))
+
+
+async def _maybe_voice_analysis(interview, context, result: dict, turns: list) -> None:
+    """
+    If the role values vocal delivery AND a recording exists, run acoustic
+    analysis and blend the vocal communication/confidence into the scores.
+    Mutates `result` in place: adds result["voice_analysis"] and updates the
+    communication_score / confidence_score. Every failure is non-fatal.
+    """
+    if not VOICE_ANALYSIS_ENABLED:
+        return
+
+    weights = (context.evaluation_weights or {}).get("weights") if context else None
+    weights = weights if isinstance(weights, dict) else DEFAULT_WEIGHTS
+    if not _voice_gate_open(weights):
+        logger.info(
+            f"[voice] role not voice-weighted (max of comm/behav/conf < {VOICE_MIN_WEIGHT}) "
+            f"— skipping voice analysis for {interview.id}"
+        )
+        return
+
+    wav_path = getattr(interview, "recording_s3_key", None)
+    if not wav_path:
+        logger.info(f"[voice] no recording on interview {interview.id} — skipping")
+        return
+
+    candidate_text = " ".join(
+        (t.get("message") or "") for t in turns if t.get("speaker") != "ai"
+    ).strip()
+
+    role_category = (context.evaluation_weights or {}).get("role_category") if context else None
+
+    from app.services.voice_analysis import run_voice_analysis
+    voice = await run_voice_analysis(
+        interview_id=str(interview.id),
+        wav_path=wav_path,
+        candidate_text=candidate_text,
+        role_category=role_category,
+        tenant_id=str(interview.tenant_id),
+    )
+    if not voice:
+        return
+
+    # Blend vocal delivery into the text-based communication/confidence scores.
+    text_comm = result.get("communication_score")
+    text_conf = result.get("confidence_score")
+    blended_comm = _blend_score(text_comm, voice.get("communication_voice"))
+    blended_conf = _blend_score(text_conf, voice.get("confidence_voice"))
+
+    # Keep full transparency of what changed (shown in the report).
+    voice["blend"] = {
+        "voice_weight":          VOICE_BLEND,
+        "text_communication":    text_comm,
+        "text_confidence":       text_conf,
+        "blended_communication": blended_comm,
+        "blended_confidence":    blended_conf,
+    }
+    result["communication_score"] = blended_comm
+    result["confidence_score"] = blended_conf
+    result["voice_analysis"] = voice
+    logger.info(
+        f"[voice] blended scores for {interview.id}: "
+        f"comm {text_comm}->{blended_comm}, conf {text_conf}->{blended_conf}"
+    )
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 async def run_evaluation(interview_id: str) -> bool:
@@ -427,6 +519,15 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
     except (ValueError, json.JSONDecodeError) as e:
         logger.error(f"[eval] JSON parse failed for {interview_id}: {e}")
         return False
+
+    # ── 9.5 Voice & delivery analysis (role-gated) ─────────────────────────────
+    # For voice-heavy roles with a recording, analyze acoustic delivery and blend
+    # it into communication/confidence BEFORE the overall score is recomputed, so
+    # the blend flows through to the final number. Fully non-fatal.
+    try:
+        await _maybe_voice_analysis(interview, context, result, turns)
+    except Exception as e:
+        logger.warning(f"[voice] analysis step skipped for {interview_id}: {e}")
 
     # ── 10. Override overall_score with the exact, ROLE-TUNED formula ─────────
     # Claude approximates the calculation. We recompute it precisely in code so

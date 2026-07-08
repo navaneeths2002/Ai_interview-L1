@@ -4,7 +4,7 @@ Crash Recovery & Reconnection Unit
 Self-contained module — ALL reload/crash resilience logic lives here.
 The agent only calls thin hooks; no agent pipeline internals are touched.
 
-Three capabilities:
+Four capabilities:
 
   1. DisconnectGraceTimer
      60-second grace period when the candidate disconnects (page reload,
@@ -20,6 +20,11 @@ Three capabilities:
      When a fresh agent job starts for an interview already 'in_progress'
      with a saved stage, the LangGraph state is restored to that stage and
      Sarah re-greets with "Welcome back…" instead of starting over.
+
+  4. AvatarWatchdog
+     Detects a dead/frozen Simli avatar DURING the interview (not just on
+     reconnect) and triggers self-healing: restart the avatar, or fall back
+     to room audio so the candidate keeps hearing Sarah.
 
 This module manages its own small DB engine (pool_size=2) so it never
 competes with or depends on the agent's DB internals.
@@ -289,3 +294,163 @@ def resume_greeting_instructions(candidate_name: str, stage: str) -> str:
         f"Then naturally re-ask the question about {topic}. "
         "Do NOT restart the interview or re-introduce yourself. One question only."
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 4. Avatar watchdog — mid-stream health check + self-heal
+# ════════════════════════════════════════════════════════════════════════════════
+
+AVATAR_WATCHDOG_INTERVAL_SECONDS = 5.0   # probe cadence
+AVATAR_WATCHDOG_SETTLE_SECONDS   = 15.0  # grace after every avatar (re)start
+AVATAR_WATCHDOG_STRIKES          = 2     # consecutive failed probes before healing
+
+
+def has_dead_task(obj) -> bool:
+    """
+    True if any asyncio.Task attribute on `obj` finished with an exception.
+
+    Used to detect the avatar audio pipe dying mid-stream (e.g. the
+    'publisher connection timeout' failure) without pinning exact SDK
+    internals — ANY internal task that raised means the pipe is broken.
+    Purely defensive: never raises, never false-alarms on healthy objects.
+    """
+    try:
+        for val in vars(obj).values():
+            if isinstance(val, asyncio.Task) and val.done() and not val.cancelled():
+                try:
+                    if val.exception() is not None:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+class AvatarWatchdog:
+    """
+    Detects a dead/frozen avatar DURING the interview and triggers healing.
+
+    The failure this covers: with the avatar active, ALL of Sarah's voice
+    routes through the Simli participant. If the agent→Simli pipe dies
+    mid-stream (Simli worker crash, publisher connection timeout), the
+    candidate silently stops hearing her — previously this only healed on a
+    candidate reconnect. The watchdog heals it live.
+
+    Wiring (agent.py provides the callbacks):
+      is_avatar_alive()      → sync health probe (participant + task check)
+      is_candidate_present() → sync; probes are skipped while the candidate is
+                               away (avatar teardown on disconnect is EXPECTED)
+      on_failure()           → async heal: restart the avatar or fall back to
+                               room audio
+
+    Lifecycle hooks:
+      start() / stop()       → start/cancel the probe loop (idempotent)
+      avatar_started()       → call after every successful avatar (re)start;
+                               resets strikes and opens a settle window
+      notify_avatar_left()   → fast path from participant_disconnected — heal
+                               immediately instead of waiting for the next probe
+    """
+
+    def __init__(
+        self,
+        *,
+        is_avatar_alive: Callable[[], bool],
+        is_candidate_present: Callable[[], bool],
+        on_failure: Callable[[], Awaitable[None]],
+        interview_id: str | None = None,
+        interval_seconds: float = AVATAR_WATCHDOG_INTERVAL_SECONDS,
+        settle_seconds: float = AVATAR_WATCHDOG_SETTLE_SECONDS,
+        strikes_to_fail: int = AVATAR_WATCHDOG_STRIKES,
+    ) -> None:
+        self._is_avatar_alive      = is_avatar_alive
+        self._is_candidate_present = is_candidate_present
+        self._on_failure           = on_failure
+        self._interview_id         = interview_id
+        self._interval             = interval_seconds
+        self._settle               = settle_seconds
+        self._strikes_to_fail      = strikes_to_fail
+
+        self._task: asyncio.Task | None = None
+        self._strikes      = 0
+        self._settle_until = 0.0
+        # Strong refs for fire-and-forget heal tasks (GC safety)
+        self._pending: set[asyncio.Task] = set()
+
+    # ── lifecycle ──────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._loop(), name="avatar-watchdog")
+        logger.info(
+            f"[avatar-watchdog] started (probe every {self._interval:.0f}s)",
+            extra={"interview_id": self._interview_id},
+        )
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+        self._strikes = 0
+
+    def avatar_started(self) -> None:
+        """Avatar (re)started successfully — reset strikes, open settle window."""
+        self._strikes = 0
+        self._settle_until = asyncio.get_running_loop().time() + self._settle
+
+    def notify_avatar_left(self) -> None:
+        """
+        Fast path: the simli-avatar participant disconnected. If the candidate
+        is still here (i.e. this is NOT the expected teardown after a candidate
+        disconnect), heal immediately instead of waiting for probe strikes.
+        """
+        if not self._task or self._task.done():
+            return
+        now = asyncio.get_running_loop().time()
+        if now < self._settle_until:
+            return
+        if not self._is_candidate_present():
+            return
+        logger.warning(
+            "[avatar-watchdog] avatar participant left mid-interview — healing now",
+            extra={"interview_id": self._interview_id},
+        )
+        self._settle_until = now + self._settle  # give the heal time to work
+        self._strikes = 0
+        heal = asyncio.create_task(self._on_failure(), name="avatar-heal")
+        self._pending.add(heal)
+        heal.add_done_callback(self._pending.discard)
+
+    # ── probe loop ─────────────────────────────────────────────────────────────
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                now = asyncio.get_running_loop().time()
+                if now < self._settle_until:
+                    continue
+                if not self._is_candidate_present():
+                    # Candidate away → avatar teardown is expected, not a failure
+                    self._strikes = 0
+                    continue
+                if self._is_avatar_alive():
+                    self._strikes = 0
+                    continue
+
+                self._strikes += 1
+                logger.warning(
+                    f"[avatar-watchdog] avatar health probe failed "
+                    f"({self._strikes}/{self._strikes_to_fail})",
+                    extra={"interview_id": self._interview_id},
+                )
+                if self._strikes >= self._strikes_to_fail:
+                    self._strikes = 0
+                    self._settle_until = now + self._settle
+                    await self._on_failure()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # The watchdog must never take down the interview it protects
+                logger.warning(f"[avatar-watchdog] probe error (ignored): {e}")

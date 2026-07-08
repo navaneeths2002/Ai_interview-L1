@@ -297,6 +297,66 @@ header{grid-column:2/4;background:var(--sb);border-bottom:1px solid var(--bdr);d
 .done-title{font-size:22px;font-weight:700;color:white;}
 .done-sub{font-size:13px;color:rgba(255,255,255,.5);text-align:center;max-width:320px;line-height:1.65;}
 
+/* ── 3-2-1 Countdown overlay — zoom + motion blur ───────────────────────────── */
+.countdown-scr{
+  position:fixed;inset:0;z-index:70;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;
+  background:radial-gradient(circle at 50% 44%, rgba(37,99,235,.22), rgba(5,10,20,.93) 62%);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  opacity:0;pointer-events:none;transition:opacity .35s ease;
+}
+.countdown-scr.show{opacity:1;pointer-events:all;}
+.cd-ring-wrap{position:relative;width:230px;height:230px;display:flex;align-items:center;justify-content:center;}
+/* rotating conic glow behind the number */
+.cd-ring-wrap::before{
+  content:"";position:absolute;inset:-34px;border-radius:50%;
+  background:conic-gradient(from 0deg, transparent, rgba(59,130,246,.55) 20%, transparent 45%, rgba(234,179,8,.45) 70%, transparent 92%);
+  filter:blur(28px);opacity:.85;animation:cd-spin 2.4s linear infinite;
+}
+@keyframes cd-spin{to{transform:rotate(360deg);}}
+.cd-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);}
+.cd-ring-track{fill:none;stroke:rgba(255,255,255,.10);stroke-width:5;}
+.cd-ring-fill{
+  fill:none;stroke:url(#cd-grad);stroke-width:6;stroke-linecap:round;
+  stroke-dasharray:339.292;stroke-dashoffset:339.292;   /* 2πr, r=54 */
+}
+.cd-ring-fill.cd-sweep{animation:cd-sweep 1s linear forwards;}
+@keyframes cd-sweep{from{stroke-dashoffset:0;}to{stroke-dashoffset:339.292;}}
+.cd-num{
+  position:relative;z-index:2;
+  font-size:130px;font-weight:800;line-height:1;letter-spacing:-2px;
+  font-variant-numeric:tabular-nums;
+  background:linear-gradient(180deg,#EFF6FF,#60A5FA 55%,#2563EB);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  text-shadow:0 0 40px rgba(59,130,246,.55);
+  will-change:transform,filter,opacity;
+}
+.cd-num.cd-anim{animation:cd-pop 1s cubic-bezier(.2,.7,.2,1) forwards;}
+.cd-num.go{
+  font-size:104px;letter-spacing:3px;
+  background:linear-gradient(180deg,#FEF9C3,#EAB308 55%,#CA8A04);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  text-shadow:0 0 48px rgba(234,179,8,.7);
+}
+/* motion-blur zoom in → hold → blur out */
+@keyframes cd-pop{
+  0%  {transform:scale(2.6); filter:blur(26px);opacity:0;}
+  22% {transform:scale(1);   filter:blur(0);  opacity:1;}
+  70% {transform:scale(1.03);filter:blur(0);  opacity:1;}
+  100%{transform:scale(.35); filter:blur(20px);opacity:0;}
+}
+.cd-label{
+  position:relative;z-index:2;
+  font-size:14px;font-weight:600;letter-spacing:3px;text-transform:uppercase;
+  color:rgba(255,255,255,.6);animation:cd-label-pulse 1.4s ease-in-out infinite;
+}
+@keyframes cd-label-pulse{0%,100%{opacity:.4;}50%{opacity:.85;}}
+@media (prefers-reduced-motion: reduce){
+  .cd-num.cd-anim{animation:cd-pop-soft .45s ease forwards;}
+  @keyframes cd-pop-soft{from{opacity:0;}to{opacity:1;}}
+  .cd-ring-wrap::before{animation:none;}
+}
+
 /* ── Mini Calendar panel ────────────────────────────────────────────────────── */
 .cal-panel{position:fixed;left:calc(var(--sw) + 8px);top:calc(var(--hh) + 8px);width:256px;background:var(--card);border:1px solid var(--bdr);border-radius:13px;box-shadow:var(--shmd);padding:14px;z-index:45;display:none;transition:background .25s,border-color .25s;}
 .cal-panel.show{display:block;animation:calfade .18s ease;}
@@ -378,6 +438,48 @@ body{
   background:linear-gradient(180deg,var(--pril),var(--pri))!important;
   box-shadow:0 8px 28px rgba(37,99,235,.55),0 0 22px rgba(59,130,246,.35);
 }
+
+/* ── Pre-interview readiness modal (guidelines + device/network check) ─────── */
+.pf-scrim{position:fixed;inset:0;z-index:55;background:rgba(5,10,20,.72);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;padding:20px;}
+.pf-scrim.show{display:flex;}
+.pf-modal{width:540px;max-width:100%;max-height:92vh;overflow-y:auto;background:var(--card);border:1px solid var(--bdr);border-radius:16px;box-shadow:var(--shmd);padding:22px 24px;animation:calfade .2s ease;}
+.pf-modal::-webkit-scrollbar{width:4px;}
+.pf-modal::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px;}
+.pf-title{font-size:17px;font-weight:700;display:flex;align-items:center;gap:9px;}
+.pf-title svg{width:20px;height:20px;stroke:var(--pri);fill:none;stroke-width:2;flex-shrink:0;}
+.pf-sub{font-size:12px;color:var(--mut);margin-top:6px;line-height:1.7;}
+.pf-sub b{color:var(--txt2);}
+.pf-sec{margin-top:16px;}
+.pf-sec-ttl{font-size:11.5px;font-weight:700;margin-bottom:8px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px;}
+.pf-gl{padding-left:2px;}
+.pf-gl li{list-style:none;display:flex;gap:8px;align-items:flex-start;font-size:12px;color:var(--txt2);line-height:1.5;padding:3px 0;}
+.pf-gl li::before{content:"•";color:var(--pri);font-weight:700;flex-shrink:0;}
+.pf-check{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid var(--bdr);border-radius:10px;margin-bottom:7px;background:var(--card2);}
+.pf-check-ic{width:31px;height:31px;border-radius:8px;background:var(--pribg);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.pf-check-ic svg{width:15px;height:15px;stroke:var(--pri);fill:none;stroke-width:2;}
+.pf-check-bd{flex:1;min-width:0;}
+.pf-check-lbl{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:8px;}
+.pf-check-det{font-size:11px;color:var(--mut);margin-top:2px;line-height:1.5;}
+.pf-badge{font-size:9.5px;font-weight:700;border-radius:20px;padding:4px 10px;flex-shrink:0;letter-spacing:.4px;white-space:nowrap;}
+.pf-badge.pending{background:var(--bdr);color:var(--mut);}
+.pf-badge.checking{background:var(--pribg);color:var(--pri);animation:bpulse 1s ease-in-out infinite;}
+.pf-badge.ok{background:rgba(34,197,94,.14);color:#16a34a;}
+.pf-badge.fail{background:rgba(239,68,68,.14);color:#dc2626;}
+[data-theme="dark"] .pf-badge.ok{color:#4ade80;}
+[data-theme="dark"] .pf-badge.fail{color:#f87171;}
+.pf-meter{height:6px;border-radius:3px;background:var(--bdr);overflow:hidden;margin-top:7px;}
+.pf-meter-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#22c55e);border-radius:3px;transition:width .08s linear;}
+.pf-btn{border:none;border-radius:8px;padding:6px 12px;font-family:var(--font);font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;background:var(--card2);border:1px solid var(--bdr);color:var(--txt2);}
+.pf-btn:hover{border-color:var(--pri);color:var(--pri);}
+.pf-foot{display:flex;align-items:center;gap:10px;margin-top:18px;}
+.pf-cancel{border:1px solid var(--bdr);border-radius:10px;padding:11px 18px;background:var(--card2);color:var(--txt2);font-family:var(--font);font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;}
+.pf-cancel:hover{border-color:var(--err);color:var(--err);}
+.pf-join{flex:1;padding:11px;border-radius:10px;border:none;background:var(--pri);color:#fff;font-family:var(--font);font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;}
+.pf-join:disabled{opacity:.4;cursor:not-allowed;}
+.pf-join:hover:not(:disabled){background:var(--pril);}
+.pf-anyway{display:none;font-size:11px;color:var(--mut);text-align:center;margin-top:10px;cursor:pointer;text-decoration:underline;}
+.pf-anyway.show{display:block;}
+.pf-anyway:hover{color:var(--pri);}
 </style>
 </head>
 <body>
@@ -629,6 +731,85 @@ body{
 </div><!-- /main -->
 </div><!-- /app -->
 
+<!-- ═══ Pre-interview readiness modal ═══ -->
+<div id="pf-scrim" class="pf-scrim">
+  <div class="pf-modal">
+    <div class="pf-title">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+      Interview Readiness Check
+    </div>
+    <p class="pf-sub"><span id="pf-name">Hi there</span> — you're about to join an <b>AI-powered HR screening interview</b> with <b>Sarah</b>, our AI interviewer. It takes roughly <b>15–30 minutes</b> and covers your background, experience, salary expectations, notice period and availability. The session is <b>recorded</b> and reviewed by the hiring team.</p>
+
+    <!-- Headphones recommendation — prevents mic echo (cleaner audio, no self-interruption) -->
+    <div style="display:flex;align-items:center;gap:12px;background:var(--pribg);border:1px solid var(--pri);border-radius:12px;padding:12px 15px;margin-bottom:16px;">
+      <svg viewBox="0 0 24 24" fill="none" stroke="var(--pri)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:24px;height:24px;flex-shrink:0;"><path d="M3 18v-6a9 9 0 0118 0v6"/><path d="M21 19a2 2 0 01-2 2h-1a2 2 0 01-2-2v-3a2 2 0 012-2h3zM3 19a2 2 0 002 2h1a2 2 0 002-2v-3a2 2 0 00-2-2H3z"/></svg>
+      <div style="font-size:13px;color:var(--txt2);line-height:1.55;"><b>Please use headphones or earphones.</b> They keep the audio clear and prevent echo — so Sarah hears only you, not her own voice.</div>
+    </div>
+
+    <div class="pf-sec">
+      <div class="pf-sec-ttl">Basic Guidelines</div>
+      <ul class="pf-gl">
+        <li><b>Use headphones or earphones</b> — this avoids echo and gives the clearest audio.</li>
+        <li>Sit in a quiet room with a stable internet connection.</li>
+        <li>Sarah asks one question at a time — take your time and answer naturally.</li>
+        <li>You can speak <em>or</em> type your answers; spell names letter-by-letter for clarity.</li>
+        <li>Do not close or refresh this tab. If you get disconnected, rejoin within 60 seconds.</li>
+        <li>Answer honestly and confidently — you can always ask for clarification.</li>
+      </ul>
+    </div>
+
+    <div class="pf-sec">
+      <div class="pf-sec-ttl">System Check</div>
+
+      <div class="pf-check">
+        <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div>
+        <div class="pf-check-bd">
+          <div class="pf-check-lbl">Secure connection &amp; browser</div>
+          <div class="pf-check-det" id="pf-det-secure">Checking HTTPS and voice-call support…</div>
+        </div>
+        <span class="pf-badge pending" id="pf-badge-secure">PENDING</span>
+      </div>
+
+      <div class="pf-check">
+        <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0114.08 0"/><path d="M1.42 9a16 16 0 0121.16 0"/><path d="M8.53 16.11a6 6 0 016.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg></div>
+        <div class="pf-check-bd">
+          <div class="pf-check-lbl">Network connectivity</div>
+          <div class="pf-check-det" id="pf-det-net">Measuring connection to the interview server…</div>
+        </div>
+        <span class="pf-badge pending" id="pf-badge-net">PENDING</span>
+      </div>
+
+      <div class="pf-check">
+        <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0014 0"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg></div>
+        <div class="pf-check-bd">
+          <div class="pf-check-lbl">Microphone <button id="pf-mic-retry" class="pf-btn" style="display:none;">Retry</button></div>
+          <div class="pf-check-det" id="pf-det-mic">Click "Allow" when the browser asks for microphone access.</div>
+          <div class="pf-meter"><div class="pf-meter-fill" id="pf-mic-fill"></div></div>
+        </div>
+        <span class="pf-badge pending" id="pf-badge-mic">PENDING</span>
+      </div>
+
+      <div class="pf-check">
+        <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/><path d="M19.07 4.93a10 10 0 010 14.14"/></svg></div>
+        <div class="pf-check-bd">
+          <div class="pf-check-lbl">Speakers
+            <button id="pf-spk-play" class="pf-btn">Play test sound</button>
+            <button id="pf-spk-yes" class="pf-btn" style="display:none;">Yes, I heard it</button>
+          </div>
+          <div class="pf-check-det" id="pf-det-spk">Play the test sound and confirm you can hear it.</div>
+        </div>
+        <span class="pf-badge pending" id="pf-badge-spk">PENDING</span>
+      </div>
+    </div>
+
+    <div class="pf-foot">
+      <button id="pf-cancel" class="pf-cancel">Cancel</button>
+      <button id="pf-join" class="pf-join" disabled>Join Interview</button>
+    </div>
+    <div id="pf-anyway" class="pf-anyway">Having trouble with a check? Join anyway — you can type your answers</div>
+  </div>
+</div>
+
 <!-- Overlay -->
 <div id="overlay" class="overlay">
   <div class="ov-spin"></div>
@@ -641,6 +822,24 @@ body{
   <div class="done-chk"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
   <div class="done-title">Interview Complete</div>
   <div class="done-sub">Thank you for your time. Our team will review your profile and reach out to you shortly.</div>
+</div>
+
+<!-- 3-2-1 Countdown -->
+<div id="countdown-scr" class="countdown-scr">
+  <div class="cd-ring-wrap">
+    <svg class="cd-ring" viewBox="0 0 120 120">
+      <defs>
+        <linearGradient id="cd-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#60A5FA"/>
+          <stop offset="100%" stop-color="#EAB308"/>
+        </linearGradient>
+      </defs>
+      <circle class="cd-ring-track" cx="60" cy="60" r="54"/>
+      <circle id="cd-ring-fill" class="cd-ring-fill" cx="60" cy="60" r="54"/>
+    </svg>
+    <div id="cd-num" class="cd-num">3</div>
+  </div>
+  <div id="cd-label" class="cd-label">Get ready…</div>
 </div>
 
 <script>
@@ -1283,12 +1482,233 @@ document.getElementById('cinput').addEventListener('keydown', e => {
 
 document.querySelector('.btn-send').addEventListener('click', sendTypedMessage);
 
+// ── Pre-interview readiness check (guidelines + mic/speaker/network test) ────
+// Runs BEFORE joining: catches the silent killers up-front — http:// page
+// (browser blocks the mic on non-secure origins), denied mic permission,
+// muted/broken speakers, and no route to the server.
+const pf = {
+  micStream: null, micCtx: null, micRaf: null, toneCtx: null,
+  results: { secure: null, net: null, mic: null, spk: null },
+};
+const pfScrim = document.getElementById('pf-scrim');
+
+function pfBadge(row, state, text) {
+  const b = document.getElementById('pf-badge-' + row);
+  if (b) { b.className = 'pf-badge ' + state; b.textContent = text; }
+}
+function pfDetail(row, text) {
+  const d = document.getElementById('pf-det-' + row);
+  if (d) d.textContent = text;
+}
+function pfSet(row, ok, badgeText, detail) {
+  pf.results[row] = ok;
+  pfBadge(row, ok ? 'ok' : 'fail', badgeText || (ok ? 'PASSED' : 'FAILED'));
+  if (detail !== undefined) pfDetail(row, detail);
+  pfUpdateJoin();
+}
+function pfUpdateJoin() {
+  const r = pf.results;
+  document.getElementById('pf-join').disabled =
+    !(r.secure && r.net && r.mic && r.spk);
+  // Offer the escape hatch only once something actually failed
+  const anyFail = [r.secure, r.net, r.mic, r.spk].some(v => v === false);
+  document.getElementById('pf-anyway').classList.toggle('show', anyFail);
+}
+
+function openPreflight() {
+  // Rejoin (in-progress) skips the checks — the 60s grace window is ticking
+  // and the devices already worked moments ago.
+  if (cachedTokenData && cachedTokenData.status === 'in_progress') { startInterview(); return; }
+  const name = cachedTokenData && cachedTokenData.candidate_name;
+  document.getElementById('pf-name').textContent = name ? ('Hi ' + name.split(/\s+/)[0]) : 'Hi there';
+  pf.results = { secure: null, net: null, mic: null, spk: null };
+  document.getElementById('pf-mic-retry').style.display = 'none';
+  document.getElementById('pf-spk-yes').style.display = 'none';
+  document.getElementById('pf-mic-fill').style.width = '0%';
+  pfDetail('spk', 'Play the test sound and confirm you can hear it.');
+  pfBadge('spk', 'pending', 'AWAITING TEST');
+  pfUpdateJoin();
+  pfScrim.classList.add('show');
+  runSecureCheck();
+  runNetCheck();
+  runMicCheck();
+}
+
+function runSecureCheck() {
+  // getUserMedia only exists on secure origins (https:// or localhost). This
+  // catches "opened the http:// link on another device" — the browser would
+  // silently block the mic and the candidate would sit in a dead interview.
+  if (!window.isSecureContext || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    pfSet('secure', false, 'FAILED',
+      'This page is not secure (HTTPS) — the browser blocks microphone access. Open the https:// link from your invite email.');
+  } else if (typeof RTCPeerConnection !== 'function') {
+    pfSet('secure', false, 'FAILED',
+      'This browser does not support voice calls — please use the latest Chrome or Edge.');
+  } else {
+    pfSet('secure', true, 'PASSED', 'Secure context — browser supports voice interviews.');
+  }
+}
+
+async function runNetCheck() {
+  pfBadge('net', 'checking', 'CHECKING…');
+  try {
+    const t0  = performance.now();
+    const res = await fetch('/health', { cache: 'no-store' });
+    const ms  = Math.round(performance.now() - t0);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (ms < 400) pfSet('net', true, 'PASSED', 'Connected — latency ' + ms + ' ms.');
+    else pfSet('net', true, 'SLOW', 'Connected but slow (' + ms + ' ms). Move closer to your router if possible.');
+  } catch (e) {
+    pfSet('net', false, 'FAILED', 'Cannot reach the interview server. Check your internet connection, then reopen this page.');
+  }
+}
+
+async function runMicCheck() {
+  // Stop any previous test stream first (retry path)
+  if (pf.micStream) { pf.micStream.getTracks().forEach(t => t.stop()); pf.micStream = null; }
+  pf.results.mic = null;
+  pfBadge('mic', 'checking', 'ALLOW MIC…');
+  pfDetail('mic', 'Waiting for permission — click "Allow" when the browser asks.');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    pf.micStream = stream;
+    pfBadge('mic', 'checking', 'SAY SOMETHING…');
+    pfDetail('mic', 'Permission granted. Say a few words — the bar below should move.');
+    if (!pf.micCtx) pf.micCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (pf.micCtx.state === 'suspended') pf.micCtx.resume();
+    const src = pf.micCtx.createMediaStreamSource(stream);
+    const an  = pf.micCtx.createAnalyser();
+    an.fftSize = 256; an.smoothingTimeConstant = .7;
+    src.connect(an);
+    const fill = document.getElementById('pf-mic-fill');
+    let heard = false;
+    (function tick() {
+      if (!pf.micStream) return;   // modal closed / retried — stop the loop
+      const d = new Uint8Array(an.frequencyBinCount);
+      an.getByteFrequencyData(d);
+      const avg = d.reduce((a, b) => a + b, 0) / d.length / 255;
+      if (fill) fill.style.width = Math.min(100, Math.round(avg * 260)) + '%';
+      if (avg > 0.06 && !heard) {
+        heard = true;
+        pfSet('mic', true, 'PASSED', 'Voice detected — your microphone works.');
+      }
+      pf.micRaf = requestAnimationFrame(tick);
+    })();
+    setTimeout(() => {
+      if (pf.results.mic === null && pf.micStream) {
+        pfDetail('mic', 'Still listening… check that the correct microphone is selected (lock icon in the address bar) and it is not muted.');
+      }
+    }, 12000);
+  } catch (e) {
+    pfSet('mic', false, 'FAILED',
+      'Microphone blocked or unavailable. Click the lock icon in the address bar → allow Microphone → press Retry.');
+    document.getElementById('pf-mic-retry').style.display = 'inline-block';
+  }
+}
+
+document.getElementById('pf-mic-retry').addEventListener('click', () => {
+  document.getElementById('pf-mic-retry').style.display = 'none';
+  runMicCheck();
+});
+
+document.getElementById('pf-spk-play').addEventListener('click', () => {
+  try {
+    if (!pf.toneCtx) pf.toneCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = pf.toneCtx;
+    if (ctx.state === 'suspended') ctx.resume();
+    const now = ctx.currentTime;
+    // Three-note ascending chime — unmistakable through cheap speakers
+    [[440, 0], [554, .28], [659, .56]].forEach(([f, off]) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, now + off);
+      g.gain.exponentialRampToValueAtTime(.3,    now + off + .03);
+      g.gain.exponentialRampToValueAtTime(.0001, now + off + .26);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now + off); o.stop(now + off + .3);
+    });
+    pfBadge('spk', 'checking', 'PLAYED');
+    pfDetail('spk', 'Did you hear the three-note chime? If not, raise your volume and play it again.');
+    document.getElementById('pf-spk-yes').style.display = 'inline-block';
+  } catch (e) {
+    pfSet('spk', false, 'FAILED', 'Could not play audio — check your output device and try again.');
+  }
+});
+
+document.getElementById('pf-spk-yes').addEventListener('click', () => {
+  pfSet('spk', true, 'PASSED', 'Speakers working.');
+});
+
+function pfCleanup() {
+  if (pf.micRaf) { cancelAnimationFrame(pf.micRaf); pf.micRaf = null; }
+  if (pf.micStream) { pf.micStream.getTracks().forEach(t => t.stop()); pf.micStream = null; }
+  if (pf.micCtx) { try { pf.micCtx.close(); } catch (e) {} pf.micCtx = null; }
+  if (pf.toneCtx) { try { pf.toneCtx.close(); } catch (e) {} pf.toneCtx = null; }
+}
+
+document.getElementById('pf-cancel').onclick = () => {
+  pfCleanup();
+  pfScrim.classList.remove('show');
+};
+document.getElementById('pf-join').onclick = () => {
+  pfCleanup();   // release the test mic BEFORE LiveKit captures it
+  pfScrim.classList.remove('show');
+  startInterview();
+};
+document.getElementById('pf-anyway').onclick = () => {
+  pfCleanup();
+  pfScrim.classList.remove('show');
+  addMsg('sys', '⚠ Joined with failed checks — if voice does not work, type your answers in the box below.');
+  startInterview();
+};
+
 // ── LiveKit connect ───────────────────────────────────────────────────────────
-document.getElementById('startBtn').onclick  = startInterview;
+document.getElementById('startBtn').onclick  = openPreflight;
 document.getElementById('endBtn').onclick    = endInterview;
+
+// ── 3-2-1 animated countdown (zoom + motion blur) before the interview connects ──
+function runCountdown(seconds = 3) {
+  return new Promise(resolve => {
+    const scr  = document.getElementById('countdown-scr');
+    const num  = document.getElementById('cd-num');
+    const ring = document.getElementById('cd-ring-fill');
+    const lbl  = document.getElementById('cd-label');
+    if (!scr || !num) { resolve(); return; }   // fail-safe: never block the interview
+
+    const play = (text, isGo) => {
+      num.textContent = text;
+      num.classList.toggle('go', !!isGo);
+      // restart the CSS animations by forcing a reflow
+      num.classList.remove('cd-anim');  void num.offsetWidth;  num.classList.add('cd-anim');
+      if (ring) { ring.classList.remove('cd-sweep'); void ring.offsetWidth; ring.classList.add('cd-sweep'); }
+    };
+
+    scr.classList.add('show');
+    let n = seconds;
+    if (lbl) lbl.textContent = 'Get ready…';
+    play(n);
+
+    const iv = setInterval(() => {
+      n--;
+      if (n > 0) {
+        play(n);
+      } else {
+        clearInterval(iv);
+        if (lbl) lbl.textContent = "Let's begin";
+        play('GO', true);
+        setTimeout(() => {
+          scr.classList.remove('show');
+          num.classList.remove('go');
+          resolve();
+        }, 700);
+      }
+    }, 1000);
+  });
+}
 
 async function startInterview() {
   document.getElementById('startBtn').disabled = true;
+  await runCountdown(3);   // animated 3-2-1 → GO before connecting
   document.getElementById('overlay').classList.add('show');
   setAvatarMode('thinking');
   try {
@@ -1393,8 +1813,20 @@ async function startInterview() {
       }
     });
 
-    room.on(LivekitClient.RoomEvent.TrackUnsubscribed, t => {
+    room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (t, pub, participant) => {
       if (t.kind === LivekitClient.Track.Kind.Audio) t.detach();
+      // AVATAR SELF-HEAL (client side): if the avatar's video drops
+      // mid-interview (Simli worker died), show the plasma orb again instead
+      // of a frozen frame. The agent-side watchdog keeps the voice flowing
+      // (avatar restart or room-audio fallback); if the avatar restarts, a new
+      // TrackSubscribed re-attaches the video automatically.
+      if (t.kind === LivekitClient.Track.Kind.Video && participant && participant.identity === 'simli-avatar') {
+        const videoEl = document.getElementById('avatar-video');
+        try { t.detach(videoEl); } catch (e) {}
+        videoEl.style.display = 'none';
+        document.getElementById('plasma-canvas').style.display = 'block';
+        console.log('[avatar] Simli video dropped — plasma fallback shown');
+      }
     });
 
     room.on(LivekitClient.RoomEvent.TranscriptionReceived, (segs, part) => handleTx(segs, part));

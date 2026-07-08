@@ -26,6 +26,10 @@ def _is_excluded(path: str) -> bool:
     # HTML report — opened directly in browser, no tenant header possible
     if path.startswith("/api/v1/interviews/") and path.endswith("/report/html"):
         return True
+    # ATS integration endpoint — authenticated by X-API-Key (Connector key),
+    # tenant is supplied in the request body, not the header.
+    if path.startswith("/api/v1/integration/"):
+        return True
     return False
 
 
