@@ -34,11 +34,6 @@ class Settings(BaseSettings):
     ats_base_url: str = ""
     ats_service_token: str = ""
 
-    # ── ATS Integration (direct DB pull + push trigger) ──────────────────────
-    # Read-only connection string to the ATS module's Postgres (a SEPARATE db).
-    # Same NullPool style as the main engine — see app/services/ats_connector.py.
-    ats_database_url: str = ""
-
     # AI Models
     anthropic_api_key: str = ""
     openai_api_key: str = ""

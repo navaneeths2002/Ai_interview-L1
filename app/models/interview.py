@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Boolean, Text, DateTime, Float
+from sqlalchemy import String, Integer, Boolean, Text, DateTime, Float, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -173,3 +173,34 @@ class InterviewCost(BaseModel):
     usage: Mapped[dict] = mapped_column(JSONB, nullable=True)   # merged raw usage
     cost:  Mapped[dict] = mapped_column(JSONB, nullable=True)   # per-tool USD breakdown
     total_usd: Mapped[float] = mapped_column(Float, nullable=True)
+
+
+class AtsImport(BaseModel):
+    """
+    Raw candidate data PUSHED by the ATS (their export → POST /integration/import),
+    stored verbatim so we can build a trigger payload later WITHOUT touching the
+    ATS again. One row per (tenant, candidate, job); re-import upserts = refresh.
+    """
+    __tablename__ = "ats_imports"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "ats_candidate_id", "ats_job_id",
+            name="uq_ats_imports_tenant_candidate_job",
+        ),
+    )
+
+    ats_candidate_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    ats_job_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+    candidate_name: Mapped[str] = mapped_column(String(255), nullable=True)
+    candidate_email: Mapped[str] = mapped_column(String(255), nullable=True)
+    candidate_phone: Mapped[str] = mapped_column(String(50), nullable=True)
+    resume_filename: Mapped[str] = mapped_column(String(255), nullable=True)
+
+    # Raw ATS payloads, stored exactly as pushed (pass straight through to trigger).
+    parsed_resume: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    ats_score: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    jd: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
