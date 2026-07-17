@@ -2,120 +2,113 @@
 
 **Audience:** ATS development team
 **Owner:** Interview Agent team
-**Model:** PUSH import. The ATS exports its data as JSON and **POSTs it to us**;
-we store it. We then build the trigger payload and start interviews ourselves.
-The Interview Agent never connects to the ATS database or API.
+**Model:** Single call. The ATS sends only IDs; the Interview Agent reads the
+candidate's resume/score/job from the ATS database (read-only), starts the
+interview, and returns the join link — all in one request.
 
 ---
 
-## 1. How it works (one picture)
+## 1. How it works (one call)
 
 ```
-ATS side:
-  export candidate data as JSON  ──►  POST /api/v1/integration/import
-                                          │
+ATS  ──►  POST /api/v1/integration/interview      X-API-Key: <key we give you>
+          { candidate_id, job_id, tenant_id }
+              │
 Interview Agent:
-  stores every record verbatim in our DB (table: ats_imports)
-
-Then the Interview Agent team (not the ATS) does:
-  POST /api/v1/integration/build-payload  { candidate_id, job_id, tenant_id }
-        → returns the trigger JSON (built from the stored record)
-  POST /api/v1/interviews/trigger  (that JSON)  → interview scheduled + emailed
+   ├─ reads candidate + parsed_resume + ats_score + JD from the ATS DB (read-only)
+   ├─ builds strategy, creates the room + signed invite link, emails the candidate
+   └─ returns ──►  { interview_id, join_url, status, evaluation_weights }
 ```
 
-**What the ATS team needs to do: only Step 1 — push the JSON.** Everything after
-is on the Interview Agent side.
-
-> No API key on the endpoint right now (testing). Protect it at the network level
-> (private networking / security group). A key can be added later if exposed publicly.
+One request in, the join link out. No import step, no second call.
 
 ---
 
-## 2. The endpoint the ATS calls
+## 2. What the ATS team must provide
+
+### 2a. Read-only DB access  ✅ (already working against `testatsbjr`)
+We read your MySQL directly, read-only. Needed:
+- A **read-only** MySQL user.
+- Host / port / database / user / password — we hold it as `ATS_DATABASE_URL`.
+- Network access from our server to your MySQL (firewall / security group), port 3306.
+
+### 2b. The one table we read — ✅ verified end-to-end
+We read **only** the consolidated table you grant us read-only access to:
+
+**`AiInterviewScheduleDetails`** — one row per (candidate, job):
+
+| Column | Holds |
+|---|---|
+| `candidate_id` | the id you send |
+| `job_id` | the id you send |
+| `ResumeParseData` (json) | raw `/parse` output — we read name/email/phone/skills from here |
+| `ScoreJsonData` (json) | raw `/ats-score` result |
+| `JobDetailsJsonData` (json) | job basics: `JOB_TITLE`, `JOB_DESCRIPTION`, `REQUIREMENTS`, … |
+
+**You populate this table**, then call the endpoint below with the `candidate_id`
++ `job_id`. We never touch any other table.
+
+**Note:** `JobDetailsJsonData` currently carries only job *basics* — no required
+skills, salary, or min-experience. The interview still runs; it's just lighter on
+JD-alignment. If you want richer JD-aware interviews, add those fields to
+`JobDetailsJsonData`.
+
+### 2c. Call the endpoint
+When a recruiter selects a candidate for the AI interview, call the endpoint below.
+You only send IDs — we read the rest ourselves.
+
+---
+
+## 3. The endpoint
 
 ### Request
 ```
-POST  http://<interview-agent-host>/api/v1/integration/import
+POST  https://<interview-agent-host>/api/v1/integration/interview
 Content-Type: application/json
+X-API-Key: <the key we give you>
 
 {
-  "tenant_id": "tenant-001",
-  "records": [
-    {
-      "candidate_id": "CAND-001",
-      "job_id": "JOB-77",
-      "candidate_name": "Rajiv Chaudhary",
-      "candidate_email": "rajiv@example.com",      // REQUIRED for the interview invite
-      "candidate_phone": "+91XXXXXXXXXX",
-      "resume_filename": "Rajiv_Chaudhary.pdf",
-      "parsed_resume": { ...raw /parse output... },
-      "ats_score":     { ...raw /ats-score output... },
-      "jd":            { ...raw JD / job-description output... }
-    }
-    // ... one object per candidate+job, batch — send everything
-  ]
+  "candidate_id": "<your candidate id>",
+  "job_id":       "<your job id>",
+  "tenant_id":    "<your tenant id>"
 }
 ```
 
-- Send **all records in one POST** (batch). Re-sending refreshes existing rows
-  (matched on `tenant_id` + `candidate_id` + `job_id`).
-- `parsed_resume`, `ats_score`, `jd` are your **raw** exports — passed straight
-  through; you don't need to reshape their inner contents.
-- **`candidate_email` is required** — the interview join link is emailed to it.
-
-### Success response — `200 OK`
+### Success — `200 OK`
 ```json
-{ "imported": 12, "tenant_id": "tenant-001", "message": "Imported/refreshed 12 record(s)." }
+{
+  "interview_id": "e57628ef-...",
+  "candidate_id": "...",
+  "status": "scheduled",
+  "join_url": "https://<host>/interview/e57628ef-...?token=...",
+  "message": "Interview scheduled for <name>.",
+  "evaluation_weights": { ... }
+}
 ```
+Store `interview_id` (to fetch results later). `join_url` is already emailed to
+the candidate; keep it if you want to show/resend it.
 
 ### Example
 ```bash
-curl -X POST http://<host>/api/v1/integration/import \
+curl -X POST https://<host>/api/v1/integration/interview \
   -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "tenant-001",
-    "records": [
-      { "candidate_id": "CAND-001", "job_id": "JOB-77",
-        "candidate_email": "rajiv@example.com",
-        "parsed_resume": {}, "ats_score": {}, "jd": {} }
-    ]
-  }'
+  -H "X-API-Key: <your key>" \
+  -d '{"candidate_id":"CAND-001","job_id":"JOB-77","tenant_id":"tenant-001"}'
 ```
+
+### Errors
+| Status | Meaning | What to check |
+|---|---|---|
+| `401` | Missing/invalid `X-API-Key` | the key we gave you |
+| `404` | Candidate not found for that `candidate_id` | ID correct? row exists? |
+| `422` | Candidate has **no email** | email is mandatory |
+| `502` | ATS DB read failed | schema names / DB reachable / read grant |
+| `503` | `ATS_DATABASE_URL` not configured on our side | our setup, not yours |
+| `500` | Interview creation failed | contact Interview Agent team |
 
 ---
 
-## 3. What the Interview Agent does after (FYI — no ATS action)
-
-**Build the trigger JSON for a chosen candidate:**
-```
-POST /api/v1/integration/build-payload
-{ "candidate_id": "CAND-001", "job_id": "JOB-77", "tenant_id": "tenant-001" }
-```
-Returns the full body for the trigger endpoint. **404** if that record wasn't
-imported yet.
-
-**Trigger the interview** with that returned JSON:
-```
-POST /api/v1/interviews/trigger
-Header: X-Tenant-ID: tenant-001
-Body:   <the JSON returned by build-payload>
-```
-→ interview scheduled, join link emailed to the candidate.
-
----
-
-## 4. The one open item — the export shape
-
-We defined the `records[]` shape above. If your export looks different, either:
-- map your export into this shape before POSTing (recommended), **or**
-- send us one **sample** of your raw export and we'll adapt the importer to it.
-
-The inner contents of `parsed_resume` / `ats_score` / `jd` should be your raw
-`/parse`, `/ats-score`, and JD outputs — we consume those formats directly.
-
----
-
-## 5. Getting results back (Phase 2 — not built yet)
+## 4. Getting results back (Phase 2 — not built yet)
 
 After the interview, scores + a recruiter report exist. To be decided together:
 - **Webhook** — we POST `interview.completed` to a URL you expose, or
@@ -123,20 +116,21 @@ After the interview, scores + a recruiter report exist. To be decided together:
 
 ---
 
-## 6. Go-live checklist
+## 5. Go-live checklist
 
-- [ ] ATS: export candidate data into the `records[]` shape (Section 2)
-- [ ] ATS: POST it to `/integration/import`
-- [ ] ATS: confirm `candidate_email` is present on every record
-- [ ] Interview Agent: run the `ats_imports` migration (`alembic upgrade head`)
-- [ ] Interview Agent: adjust JD field-name mapping if the export shape differs
-- [ ] Both: one real candidate imported → build-payload → trigger → end-to-end test
+- [ ] ATS: read-only DB user + connection string shared
+- [ ] ATS: network/SSL access to Postgres opened for our server
+- [ ] ATS: table/column names provided (Section 2b)
+- [ ] ATS: confirm `candidate_email` is present on every candidate
+- [ ] Interview Agent: `ATS_DATABASE_URL` set + schema placeholders filled + `CONNECTOR_API_KEY` set
+- [ ] ATS: call the endpoint on candidate selection with the `X-API-Key`
+- [ ] Both: first real candidate tested end-to-end (validates the field mapping)
 
 ---
 
-## 7. API contract (interactive)
+## 6. API contract (interactive)
 
 While our server runs, the live contract is at:
 ```
-http://<interview-agent-host>/docs        (Swagger UI — "Integration" section)
+https://<interview-agent-host>/docs        (Swagger UI — "Integration" section)
 ```

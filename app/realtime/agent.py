@@ -2,6 +2,7 @@ import asyncio
 import logging
 import pathlib
 import random
+import time
 import uuid
 import os
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ logger = get_logger(__name__)
 _env_path = pathlib.Path(__file__).resolve().parent.parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path, override=False)
 
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli
 from livekit.agents import llm, metrics
 from livekit.agents.voice import room_io
 from livekit.plugins import deepgram, anthropic, silero, simli
@@ -38,6 +39,36 @@ from app.realtime.interview_graph import build_interview_graph, make_initial_sta
 from app.realtime import crash_recovery
 from app.realtime import audio_capture
 from app.services import cost_tracker
+
+
+# ── Deepgram TTS speech-speed control ───────────────────────────────────────────
+# Deepgram Aura supports a `speed` query param (0.7–1.5, default 1.0), but the
+# livekit plugin doesn't expose it. Both the plugin's WebSocket and HTTP request
+# paths build their URL via deepgram.tts._to_deepgram_url(opts, base_url), so we
+# wrap that ONE function to inject `speed`. If Deepgram ever rejects the param,
+# set the speed back to 1.0 — nothing else is affected.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  EDIT THIS to change how fast Sarah speaks:                              │
+# │    1.0  = normal        1.15 = slightly brisk                           │
+# │    1.25 = noticeably faster   1.5 = maximum   (allowed range: 0.7–1.5)  │
+# └─────────────────────────────────────────────────────────────────────────┘
+DEEPGRAM_TTS_SPEED = 1.15
+
+_DG_TTS_SPEED = max(0.7, min(1.5, float(DEEPGRAM_TTS_SPEED)))
+if _DG_TTS_SPEED != 1.0:
+    try:
+        from livekit.plugins.deepgram import tts as _dg_tts_mod
+        _dg_orig_to_url = _dg_tts_mod._to_deepgram_url
+
+        def _dg_to_url_with_speed(opts, base_url, *, websocket):
+            opts = {**opts, "speed": _DG_TTS_SPEED}
+            return _dg_orig_to_url(opts, base_url, websocket=websocket)
+
+        _dg_tts_mod._to_deepgram_url = _dg_to_url_with_speed
+        logger.info(f"[tts] Deepgram speech speed override active: speed={_DG_TTS_SPEED}")
+    except Exception as _e:
+        logger.warning(f"[tts] could not enable Deepgram speed override (non-fatal): {_e}")
 
 
 # ── Base system prompt ─────────────────────────────────────────────────────────
@@ -551,8 +582,43 @@ class HRInterviewAgent(Agent):
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 
+# ── VAD prewarm (startup latency) ──────────────────────────────────────────────
+# Silero's model was previously loaded INSIDE the entrypoint, i.e. re-loaded from
+# disk for EVERY interview — seconds of dead time before the candidate hears
+# anything. prewarm_fnc runs once when the worker boots, so every job reuses the
+# already-loaded model. Config lives in _build_vad() so prewarm and the fallback
+# can never drift apart.
+
+def _build_vad():
+    """Silero VAD config — single source of truth (prewarm + fallback)."""
+    return silero.VAD.load(
+        # Lever A — barge-in rate control. The old 50ms / 0.1 settings were so
+        # sensitive that breaths, clicks, and (worst) Sarah's own echo from the
+        # avatar registered as speech, each firing a false barge-in. Raised to
+        # filter noise/echo while still catching a genuinely quiet candidate.
+        min_speech_duration=0.20,       # 200ms — ignore clicks/breaths/short echo blips
+        min_silence_duration=0.5,
+        activation_threshold=0.40,      # less sensitive — noise/echo no longer trips it
+        prefix_padding_duration=0.3,
+    )
+
+
+def prewarm(proc: JobProcess) -> None:
+    """Load the VAD once at worker boot (registered as WorkerOptions.prewarm_fnc)."""
+    t0 = time.monotonic()
+    proc.userdata["vad"] = _build_vad()
+    logger.info(f"[prewarm] Silero VAD loaded in {time.monotonic() - t0:.2f}s")
+
+
 async def entrypoint(ctx: JobContext):
+    # Startup timing — tells us exactly where the join latency goes.
+    _t0 = time.monotonic()
+
+    def _lap(label: str) -> None:
+        logger.info(f"[startup] {label:<22} +{time.monotonic() - _t0:5.2f}s")
+
     await ctx.connect()
+    _lap("ctx.connect")
 
     # Derive interview_id from room name ("interview-<uuid>")
     room_name    = ctx.room.name or ""
@@ -568,6 +634,7 @@ async def entrypoint(ctx: JobContext):
     ctx_data = {}
     if interview_id:
         ctx_data = await _load_interview_context(interview_id)
+    _lap("db: interview ctx")
 
     tenant_id      = ctx_data.get("tenant_id")
     candidate_name = ctx_data.get("candidate_name", "the candidate")
@@ -601,6 +668,7 @@ async def entrypoint(ctx: JobContext):
         resume_state = await crash_recovery.load_resume_state(interview_id)
         if resume_state:
             graph_state = crash_recovery.apply_resume(graph_state, resume_state)
+    _lap("db: resume state")
 
     logger.info(
         "LangGraph initialised",
@@ -1077,18 +1145,22 @@ async def entrypoint(ctx: JobContext):
         # which marks completed, drains transcripts, and runs evaluation.
         grace_timer.candidate_left()
 
+    # ── VAD: reuse the model prewarmed at worker boot ─────────────────────────
+    # Fallback to loading it here if prewarm didn't run (e.g. an execution mode
+    # that skips prewarm_fnc) — correctness never depends on the optimisation.
+    _vad = None
+    try:
+        _vad = ctx.proc.userdata.get("vad")
+    except Exception:
+        _vad = None
+    if _vad is None:
+        logger.warning("[startup] VAD not prewarmed — loading now (slower join)")
+        _vad = _build_vad()
+    _lap("vad ready")
+
     # ── AgentSession ──────────────────────────────────────────────────────────
     session = AgentSession(
-        vad=silero.VAD.load(
-            # Lever A — barge-in rate control. The old 50ms / 0.1 settings were so
-            # sensitive that breaths, clicks, and (worst) Sarah's own echo from the
-            # avatar registered as speech, each firing a false barge-in. Raised to
-            # filter noise/echo while still catching a genuinely quiet candidate.
-            min_speech_duration=0.20,       # 200ms — ignore clicks/breaths/short echo blips
-            min_silence_duration=0.5,
-            activation_threshold=0.40,      # less sensitive — noise/echo no longer trips it
-            prefix_padding_duration=0.3,
-        ),
+        vad=_vad,
         stt=deepgram.STT(
             api_key=os.environ["DEEPGRAM_API_KEY"],
             language="en",          # changed from en-IN — broader detection
@@ -1140,6 +1212,7 @@ async def entrypoint(ctx: JobContext):
     if not avatar_enabled:
         logger.info("AVATAR_ENABLED=false — voice-only mode (reliable)", extra={"interview_id": interview_id})
     avatar_active = await _start_avatar()
+    _lap("avatar start")
     avatar_state["active"] = avatar_active
     if avatar_active and watchdog_enabled:
         # AVATAR WATCHDOG: begin mid-stream health probing (self-heals a dead
@@ -1168,6 +1241,7 @@ async def entrypoint(ctx: JobContext):
             close_on_disconnect=False,
         ),
     )
+    _lap("session.start")
 
     # ── FIX 3: Capture AI responses via conversation_item_added event ─────────
     # The old approach read from turn_ctx AFTER super().on_user_turn_completed().
@@ -1241,13 +1315,17 @@ async def entrypoint(ctx: JobContext):
             "Be natural and friendly — like a real HR person starting a call."
         )
 
+    _lap("greeting: LLM start")
     await session.generate_reply(instructions=greeting)
+    _lap("greeting: SPOKEN")   # ← total time from job start to Sarah speaking
 
 
 if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            # Loads the Silero VAD once at worker boot instead of per interview.
+            prewarm_fnc=prewarm,
             api_key=os.environ["LIVEKIT_API_KEY"],
             api_secret=os.environ["LIVEKIT_API_SECRET"],
             ws_url=os.environ["LIVEKIT_URL"],

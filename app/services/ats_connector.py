@@ -1,16 +1,36 @@
 """
-ATS mapping helpers
-===================
-Turns a stored `ats_imports` record — the raw ATS JSON the ATS PUSHED to us via
-POST /api/v1/integration/import — into a TriggerInterviewRequest.
+ATS Connector — single call, single table
+=========================================
+The ATS grants us READ-ONLY access to exactly one consolidated table,
+`AiInterviewScheduleDetails`, which holds everything we need as three JSON
+columns. The ATS calls our integration endpoint with {candidate_id, job_id};
+we read that one row and assemble a TriggerInterviewRequest.
 
-There is NO connection to the ATS here (no DB, no HTTP). The data already lives
-in our own `ats_imports` table; this module only maps it into the trigger shape.
+    mysql+aiomysql://user:password@host:3306/dbname   (ATS_DATABASE_URL)
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  TODO(ATS): the JD JSON key names below are a best guess. Once the real ATS   ║
-║  export shape is known, adjust the JD_*_KEY values to match.                  ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+────────────────────────────────────────────────────────────────────────────────
+TABLE: AiInterviewScheduleDetails  (verified)
+  candidate_id        varchar   — the id the ATS sends
+  job_id              varchar   — the id the ATS sends
+  ResumeParseData     json      — raw /parse output (resume object directly)
+  ScoreJsonData       json      — raw /ats-score result (single result object)
+  JobDetailsJsonData  json      — job basics {ID, JOB_TITLE, JOB_DESCRIPTION, REQUIREMENTS, ...}
+  UrlExpiryTime, CreatedDate, CreatedBy — metadata (unused)
+────────────────────────────────────────────────────────────────────────────────
+Two shape fixes the extractors require:
+  • parsed_resume  — the column stores the resume object DIRECTLY, but
+    extract_resume_data() does next(iter(parsed_resume.values())), so we WRAP it
+    as { filename: ResumeParseData }.
+  • ats_score_data — the column stores a single result, but extract_ats_data()
+    reads {"results": [{"file": ..., "result": {...}}]}, so we WRAP it likewise.
+
+Candidate contact (name / email / phone) lives INSIDE ResumeParseData — there
+are no separate contact columns.
+
+NOTE: JobDetailsJsonData holds only job basics — it does NOT carry required
+skills, salary, or min-experience. Those come through empty (the interview still
+runs; JD-alignment/skill-gap probing is just lighter). If richer JD-aware
+interviews are wanted, ask the ATS to add those fields to JobDetailsJsonData.
 """
 
 from __future__ import annotations
@@ -19,29 +39,70 @@ import json
 import logging
 from typing import Any
 
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
+
+from app.core.config import settings
 from app.schemas.interview import JobInput, TriggerInterviewRequest
 
 logger = logging.getLogger(__name__)
 
+# The one table we're granted read-only access to.
+ATS_TABLE = "AiInterviewScheduleDetails"
 
-# ── keys INSIDE the JD JSON (TODO(ATS): match your JD generator's field names) ──
-JD_TITLE_KEY      = "position_title"
-JD_DEPT_KEY       = "department"
-JD_LOCATION_KEY   = "location"
-JD_TYPE_KEY       = "position_type"
-JD_MIN_EXP_KEY    = "min_experience_years"
-JD_CRITICAL_KEY   = "critical_skills"
-JD_OPTIONAL_KEY   = "optional_skills"
-JD_SOFT_KEY       = "soft_skills"
-JD_SALARY_MIN_KEY = "salary_min"
-JD_SALARY_MAX_KEY = "salary_max"
-JD_TEXT_KEY       = "jd_text"
+# ── keys INSIDE JobDetailsJsonData (job basics) ─────────────────────────────────
+JD_TITLE_KEY   = "JOB_TITLE"
+JD_DESC_KEY    = "JOB_DESCRIPTION"
+JD_REQ_KEY     = "REQUIREMENTS"
+JD_DEPT_KEY    = "Department"     # present in fuller job rows; absent here → ""
+JD_CITY_KEY    = "CITY"
+
+
+class ATSDataError(Exception):
+    """
+    Raised when ATS data can't be turned into a trigger payload. Carries an HTTP
+    status so the endpoint surfaces a CLEAR reason to the ATS team:
+      503 — ATS_DATABASE_URL not configured
+      502 — ATS db read failed (unreachable / bad credentials)
+      404 — no schedule row for that candidate + job
+      422 — candidate has no email in the resume JSON
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+_ats_engine = None
+_ats_factory = None
+
+
+def _get_ats_factory():
+    """Lazy read-only engine on the ATS db — NullPool, like app/db/session.py."""
+    global _ats_engine, _ats_factory
+    if _ats_factory is None:
+        url = settings.ats_database_url or ""
+        if not url:
+            logger.error("[ats-connector] ATS_DATABASE_URL not set — ATS pull disabled")
+            return None
+        _ats_engine = create_async_engine(url, poolclass=NullPool)
+        _ats_factory = async_sessionmaker(
+            bind=_ats_engine, class_=AsyncSession, expire_on_commit=False
+        )
+        logger.info("[ats-connector] read-only ATS (MySQL) engine created")
+    return _ats_factory
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _as_json(value: Any) -> Any:
-    """A JSON column may come back as a str — decode to dict/list if so."""
+    """MySQL JSON may arrive as a str — decode to dict/list if so."""
     if isinstance(value, str):
         try:
             return json.loads(value)
@@ -50,79 +111,139 @@ def _as_json(value: Any) -> Any:
     return value
 
 
-def _as_list(value: Any) -> list:
-    """Coerce a JD field into a list of strings (handles str, list, or None)."""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(v) for v in value]
-    return [str(value)]
-
-
-def _derive_filename(parsed_resume: Any, explicit: str | None) -> str:
-    """
-    resume_filename is the join key the agent uses to pick the right entry.
-    Prefer an explicit value; otherwise fall back to the single top-level key of
-    the parse JSON (the /parse output is keyed by filename).
-    """
-    if explicit:
-        return str(explicit)
-    if isinstance(parsed_resume, dict) and len(parsed_resume) == 1:
-        return next(iter(parsed_resume.keys()))
-    return ""
-
-
 def _to_int(value: Any) -> int:
     try:
-        return int(value)
+        return int(float(value))
     except (TypeError, ValueError):
         return 0
 
 
-def _build_job_input(job_json: Any, ats_job_id: str) -> JobInput:
-    """Map the JD JSON → JobInput. TODO(ATS): confirm the JD_*_KEY names above."""
-    j = _as_json(job_json) or {}
-    if not isinstance(j, dict):
-        j = {}
+def _clean(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _derive_tenant_id(job: dict) -> str:
+    """
+    Tenant = the ATS organisation, so each org's interview data stays grouped.
+    ORG_ID lives inside JobDetailsJsonData. Falls back to 'ats-default' if absent.
+    """
+    org_id = (job or {}).get("ORG_ID")
+    org_id = str(org_id).strip() if org_id is not None else ""
+    return f"org-{org_id}" if org_id else "ats-default"
+
+
+def _build_job_input(job: dict, ats_job_id: str) -> JobInput:
+    """
+    Map JobDetailsJsonData → JobInput. Only job basics are present; skills /
+    salary / experience aren't in this table, so they default empty/0.
+    """
+    job = job if isinstance(job, dict) else {}
+    jd_text = [t for t in (_clean(job.get(JD_DESC_KEY)), _clean(job.get(JD_REQ_KEY))) if t]
     return JobInput(
         ats_job_id=str(ats_job_id),
-        position_title=str(j.get(JD_TITLE_KEY) or ""),
-        department=str(j.get(JD_DEPT_KEY) or ""),
-        location=str(j.get(JD_LOCATION_KEY) or ""),
-        position_type=str(j.get(JD_TYPE_KEY) or "full_time"),
-        min_experience_years=_to_int(j.get(JD_MIN_EXP_KEY)),
-        critical_skills=_as_list(j.get(JD_CRITICAL_KEY)),
-        optional_skills=_as_list(j.get(JD_OPTIONAL_KEY)),
-        soft_skills=_as_list(j.get(JD_SOFT_KEY)),
-        salary_min=_to_int(j.get(JD_SALARY_MIN_KEY)),
-        salary_max=_to_int(j.get(JD_SALARY_MAX_KEY)),
-        jd_text=_as_list(j.get(JD_TEXT_KEY)),
+        position_title=_clean(job.get(JD_TITLE_KEY)),
+        department=_clean(job.get(JD_DEPT_KEY)),
+        location=_clean(job.get(JD_CITY_KEY)),
+        position_type="full_time",
+        min_experience_years=0,          # not carried in JobDetailsJsonData
+        critical_skills=[],              # not carried in JobDetailsJsonData
+        optional_skills=[],
+        soft_skills=[],
+        salary_min=0,
+        salary_max=0,
+        jd_text=jd_text,
     )
 
 
 # ── public entry point ────────────────────────────────────────────────────────
 
-def build_trigger_request(record) -> TriggerInterviewRequest:
+async def fetch_trigger_payload(
+    candidate_id: str,
+    job_id: str,
+) -> tuple[TriggerInterviewRequest, str]:
     """
-    Build a TriggerInterviewRequest from a stored AtsImport row (or any object
-    exposing the same attributes). Pure mapping — no I/O.
+    Read the one AiInterviewScheduleDetails row for (candidate_id, job_id) and
+    build the trigger request. Returns (payload, tenant_id) where tenant_id is
+    derived from the ATS ORG_ID. Raises ATSDataError (with an HTTP status) on any
+    recoverable problem.
     """
-    parsed_resume = _as_json(record.parsed_resume) or {}
-    ats_score_data = _as_json(record.ats_score) or {}
-    resume_filename = _derive_filename(parsed_resume, record.resume_filename)
+    factory = _get_ats_factory()
+    if not factory:
+        raise ATSDataError(503, "ATS_DATABASE_URL is not configured on the server")
+
+    try:
+        async with factory() as s:
+            row = (await s.execute(
+                text(f"""
+                    SELECT ResumeParseData, ScoreJsonData, JobDetailsJsonData
+                    FROM   {ATS_TABLE}
+                    WHERE  candidate_id = :cid AND job_id = :jid
+                    ORDER BY CreatedDate DESC
+                    LIMIT 1
+                """),
+                {"cid": str(candidate_id), "jid": str(job_id)},
+            )).mappings().fetchone()
+    except Exception as e:
+        logger.error(f"[ats-connector] ATS db read failed: {e}")
+        raise ATSDataError(
+            502,
+            "ATS database read failed — check ATS_DATABASE_URL (host/credentials), "
+            f"read access to {ATS_TABLE}, and network reachability. ({e})",
+        )
+
+    if not row:
+        raise ATSDataError(
+            404,
+            f"No Details found for Candidate ID:{candidate_id}",
+        )
+
+    resume = _as_json(row["ResumeParseData"]) or {}
+    score  = _as_json(row["ScoreJsonData"]) or {}
+    job    = _as_json(row["JobDetailsJsonData"]) or {}
+    if not isinstance(resume, dict):
+        resume = {}
+
+    # ── candidate contact — lives inside the resume JSON ──────────────────────
+    email = _clean(resume.get("email"))
+    if not email:
+        raise ATSDataError(
+            422,
+            f"candidate {candidate_id} has no email in ResumeParseData — cannot invite",
+        )
+    name = " ".join(
+        p for p in (_clean(resume.get("first_name")), _clean(resume.get("last_name"))) if p
+    )
+    phone = _clean(resume.get("phone"))
+
+    # filename — used to match resume ↔ score; take it from the parse Logs.
+    filename = _clean((resume.get("Logs") or {}).get("filename")) or "resume.pdf"
+
+    # ── WRAP for the extractors ───────────────────────────────────────────────
+    parsed_resume = {filename: resume}
+    ats_score_data = (
+        {"results": [{"file": filename, "result": score}]}
+        if isinstance(score, dict) and score else {}
+    )
+    if not ats_score_data:
+        logger.warning(
+            f"[ats-connector] no ATS score in row for candidate={candidate_id} "
+            f"job={job_id} — proceeding with empty score"
+        )
 
     payload = TriggerInterviewRequest(
-        ats_candidate_id=str(record.ats_candidate_id),
-        candidate_name=str(record.candidate_name or "Candidate"),
-        candidate_email=str(record.candidate_email or "").strip(),
-        candidate_phone=str(record.candidate_phone or ""),
-        resume_filename=resume_filename,
-        parsed_resume=parsed_resume if isinstance(parsed_resume, dict) else {},
-        ats_score_data=ats_score_data if isinstance(ats_score_data, dict) else {},
-        job=_build_job_input(record.jd, record.ats_job_id),
+        ats_candidate_id=str(candidate_id),
+        candidate_name=name or "Candidate",
+        candidate_email=email,
+        candidate_phone=phone,
+        resume_filename=filename,
+        parsed_resume=parsed_resume,
+        ats_score_data=ats_score_data,
+        job=_build_job_input(job, job_id),
     )
+    tenant_id = _derive_tenant_id(job)
     logger.info(
-        f"[ats-connector] built trigger payload from import "
-        f"candidate={record.ats_candidate_id} job={record.ats_job_id}"
+        f"[ats-connector] built trigger payload from {ATS_TABLE} — "
+        f"candidate={candidate_id} job={job_id} name='{name}' email={email} "
+        f"tenant={tenant_id}"
     )
-    return payload
+    return payload, tenant_id

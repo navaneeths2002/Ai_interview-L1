@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Boolean, Text, DateTime, Float, UniqueConstraint
+from sqlalchemy import String, Integer, Boolean, Text, DateTime, Float
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,6 +13,11 @@ class Interview(BaseModel):
 
     candidate_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+
+    # The ATS's own ids (e.g. "420" / "289") — stored directly on the interview
+    # for traceability and for the read-only results export the ATS pulls by.
+    ats_candidate_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
+    ats_job_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
 
     # scheduled, in_progress, completed, failed, no_show
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="scheduled")
@@ -175,32 +180,59 @@ class InterviewCost(BaseModel):
     total_usd: Mapped[float] = mapped_column(Float, nullable=True)
 
 
-class AtsImport(BaseModel):
+class AtsInterviewResult(BaseModel):
     """
-    Raw candidate data PUSHED by the ATS (their export → POST /integration/import),
-    stored verbatim so we can build a trigger payload later WITHOUT touching the
-    ATS again. One row per (tenant, candidate, job); re-import upserts = refresh.
+    Flat, read-only RESULTS export the ATS pulls after an interview completes.
+    One denormalised row per interview holding everything — scores, report,
+    transcript, extracted data — keyed by the ATS's own ids so they can look up
+    by (ats_candidate_id, ats_job_id). The ATS is granted READ-ONLY access to
+    this ONE table; we write it, they read it (mirror of the trigger direction).
+
+    Populated at the end of the post-interview chain (evaluation → report → here).
     """
-    __tablename__ = "ats_imports"
+    __tablename__ = "ats_interview_results"
 
-    __table_args__ = (
-        UniqueConstraint(
-            "tenant_id", "ats_candidate_id", "ats_job_id",
-            name="uq_ats_imports_tenant_candidate_job",
-        ),
-    )
+    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
 
-    ats_candidate_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    ats_job_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # The ATS queries by THESE.
+    ats_candidate_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
+    ats_job_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
 
-    candidate_name: Mapped[str] = mapped_column(String(255), nullable=True)
+    candidate_name:  Mapped[str] = mapped_column(String(255), nullable=True)
     candidate_email: Mapped[str] = mapped_column(String(255), nullable=True)
-    candidate_phone: Mapped[str] = mapped_column(String(50), nullable=True)
-    resume_filename: Mapped[str] = mapped_column(String(255), nullable=True)
+    job_title:       Mapped[str] = mapped_column(String(255), nullable=True)
+    status:          Mapped[str] = mapped_column(String(20), nullable=True)
 
-    # Raw ATS payloads, stored exactly as pushed (pass straight through to trigger).
-    parsed_resume: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    ats_score: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    jd: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    # Final verdict + dimension scores.
+    overall_score:       Mapped[int] = mapped_column(Integer, nullable=True)   # 0-100
+    recommendation:      Mapped[str] = mapped_column(String(20), nullable=True)
+    communication_score: Mapped[int] = mapped_column(Integer, nullable=True)   # 1-10
+    confidence_score:    Mapped[int] = mapped_column(Integer, nullable=True)
+    jd_fit_score:        Mapped[int] = mapped_column(Integer, nullable=True)
+    behavioral_score:    Mapped[int] = mapped_column(Integer, nullable=True)
+    salary_fit:          Mapped[bool] = mapped_column(Boolean, nullable=True)
+    experience_validated: Mapped[bool] = mapped_column(Boolean, nullable=True)
 
-    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Narrative + structured findings.
+    summary:     Mapped[str] = mapped_column(Text, nullable=True)
+    strengths:   Mapped[list] = mapped_column(JSONB, nullable=True)
+    weaknesses:  Mapped[list] = mapped_column(JSONB, nullable=True)
+    red_flags:   Mapped[list] = mapped_column(JSONB, nullable=True)
+
+    # Extracted data (CTC / notice / relocation …), voice analysis, full transcript.
+    extracted:      Mapped[dict] = mapped_column(JSONB, nullable=True)
+    voice_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    transcript:     Mapped[list] = mapped_column(JSONB, nullable=True)
+
+    # Report — link, structured payload, and the full HTML.
+    report_url:  Mapped[str] = mapped_column(String(500), nullable=True)
+    report_data: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    report_html: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # Timing.
+    scheduled_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at:       Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=True)
+
+    exported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)

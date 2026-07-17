@@ -671,4 +671,13 @@ async def _generate(db: AsyncSession, interview_id: str) -> bool:
 
     await db.commit()
     logger.info(f"[report] ✓ saved report for {interview_id}")
+
+    # Phase 2 — flatten everything into the read-only ATS results export table.
+    # Self-contained + non-fatal; the report already committed above.
+    try:
+        from app.services.ats_results_export import export_interview_results
+        await export_interview_results(interview_id)
+    except Exception as e:
+        logger.warning(f"[ats-export] could not export results for {interview_id}: {e}")
+
     return True

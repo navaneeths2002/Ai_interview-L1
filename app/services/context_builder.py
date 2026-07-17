@@ -230,6 +230,9 @@ async def build_interview_context(
         tenant_id=tenant_id,
         candidate_id=candidate.id,
         job_id=job.id,
+        # ATS's own ids — stored directly for traceability + the results export.
+        ats_candidate_id=request.ats_candidate_id,
+        ats_job_id=job_input.ats_job_id,
         status="scheduled",
         mode="browser",
         join_url=join_url,

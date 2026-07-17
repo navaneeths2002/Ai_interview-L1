@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     ats_base_url: str = ""
     ats_service_token: str = ""
 
+    # ── ATS Integration (single-call: ATS sends IDs, we pull from their DB) ──
+    # Read-only connection string to the ATS module's MySQL db (a SEPARATE db —
+    # our own app is Postgres). Format:
+    #   mysql+aiomysql://user:password@host:3306/dbname
+    ats_database_url: str = ""
+    # The API key WE generate and hand to the ATS team. They send it as the
+    # X-API-Key header when calling POST /api/v1/integration/interview.
+    connector_api_key: str = ""
+
     # AI Models
     anthropic_api_key: str = ""
     openai_api_key: str = ""
