@@ -24,10 +24,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.api_key import verify_connector_api_key
 from app.db.session import get_db
+from app.models.interview import AtsInterviewResult, Interview
 from app.services import ats_connector
 from app.services.context_builder import build_interview_context
 
@@ -90,4 +92,80 @@ async def integration_interview(
         join_url=result["join_url"],
         message=f"Interview scheduled for {result['candidate_name']}.",
         evaluation_weights=result.get("evaluation_weights"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Results — the ATS fetches the post-interview report/scores via this endpoint
+# (same api_key as the trigger; no direct DB access needed).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IntegrationResultsRequest(BaseModel):
+    """The ATS asks for results by the same ids it triggered with."""
+    candidate_id: str
+    job_id: str
+
+
+_RESULT_FIELDS = (
+    "interview_id", "ats_candidate_id", "ats_job_id", "tenant_id",
+    "candidate_name", "candidate_email", "job_title", "status",
+    "overall_score", "recommendation",
+    "communication_score", "confidence_score", "jd_fit_score", "behavioral_score",
+    "salary_fit", "experience_validated",
+    "summary", "strengths", "weaknesses", "red_flags",
+    "extracted", "voice_analysis", "transcript",
+    "report_url", "report_data", "report_html",
+    "scheduled_at", "started_at", "ended_at", "duration_seconds", "exported_at",
+)
+
+
+def _serialize_result(row: AtsInterviewResult) -> dict:
+    out: dict = {"ready": True}
+    for f in _RESULT_FIELDS:
+        out[f] = getattr(row, f, None)
+    return out
+
+
+@router.post(
+    "/integration/results",
+    dependencies=[Depends(verify_connector_api_key)],
+)
+async def integration_results(
+    body: IntegrationResultsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the completed interview's full results (scores, report, transcript,
+    extracted data) for a candidate+job. If the interview isn't finished yet,
+    returns ready=false with the current status so the ATS can poll.
+    """
+    row = (await db.execute(
+        select(AtsInterviewResult).where(
+            AtsInterviewResult.ats_candidate_id == body.candidate_id,
+            AtsInterviewResult.ats_job_id == body.job_id,
+        )
+    )).scalar_one_or_none()
+
+    if row is not None:
+        return _serialize_result(row)
+
+    # No results yet — tell the ATS whether the interview is still running or absent.
+    interview = (await db.execute(
+        select(Interview).where(
+            Interview.ats_candidate_id == body.candidate_id,
+            Interview.ats_job_id == body.job_id,
+        ).order_by(Interview.created_at.desc())
+    )).scalars().first()
+
+    if interview is not None:
+        return {
+            "ready": False,
+            "status": interview.status,   # scheduled / in_progress / completed …
+            "interview_id": str(interview.id),
+            "message": "Interview not finished — results not available yet. Poll again later.",
+        }
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No interview found for candidate_id={body.candidate_id}, job_id={body.job_id}",
     )
