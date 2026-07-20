@@ -3239,11 +3239,64 @@
       if (typingEl) { typingEl.remove(); typingEl = null; }
     }
 
+    // ── Startup UX: reconnect grace · progress messages · greet nudge ────────────
+    let connectedAt     = 0;       // ms timestamp of RoomEvent.Connected
+    const STARTUP_GRACE = 10000;   // suppress reconnect chatter for the first 10s
+    let progressEl      = null;    // the rotating "getting ready…" message
+    let progressTimer   = null;
+    let progressCap     = null;
+    let sarahGreeted    = false;
+    let candidateSpoke  = false;
+    let greetNudgeTimer = null;
+    let greetNudgeEl    = null;
+
+    const PROGRESS_MSGS = [
+      'Securing your session…',
+      'Gathering your profile…',
+      'Preparing your interview…',
+      'Sarah is getting ready…',
+    ];
+
+    // Issue 2 — rotate friendly status messages until Sarah first speaks.
+    function startProgress() {
+      stopProgress();
+      progressEl = addMsg('sys', PROGRESS_MSGS[0]);
+      let i = 0;
+      progressTimer = setInterval(() => {
+        const b = progressEl && progressEl.querySelector('.bubble');
+        if (!b) return stopProgress();
+        i = (i + 1) % PROGRESS_MSGS.length;
+        b.textContent = PROGRESS_MSGS[i];
+      }, 2500);
+      progressCap = setTimeout(stopProgress, 40000);   // never rotate forever
+    }
+    function stopProgress() {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+      if (progressCap)   { clearTimeout(progressCap);   progressCap = null; }
+      if (progressEl)    { try { progressEl.remove(); } catch (e) {} progressEl = null; }
+    }
+
+    // Issue 3 — after Sarah greets, nudge a SILENT candidate to say hi (once).
+    function armGreetNudge() {
+      if (sarahGreeted) return;          // only for the first greeting
+      sarahGreeted = true;
+      greetNudgeTimer = setTimeout(() => {
+        if (!candidateSpoke && !greetNudgeEl) {
+          greetNudgeEl = addMsg('sys', '👋 Say “hello” to Sarah to get started.');
+        }
+      }, 6000);
+    }
+    function cancelGreetNudge() {
+      candidateSpoke = true;
+      if (greetNudgeTimer) { clearTimeout(greetNudgeTimer); greetNudgeTimer = null; }
+      if (greetNudgeEl)    { try { greetNudgeEl.remove(); } catch (e) {} greetNudgeEl = null; }
+    }
+
     function handleTx(segs, part) {
       const isAI = part && part.identity !== room.localParticipant.identity;
       const role = isAI ? 'ai' : 'you';
-      if (isAI) { hideTyping(); setAvatarMode('speaking'); }
-      else { setAvatarMode('listening'); }
+      if (isAI) { hideTyping(); setAvatarMode('speaking'); stopProgress(); }
+      else { setAvatarMode('listening'); cancelGreetNudge(); }
       for (const seg of segs) {
         if (!seg.text.trim()) continue;
         if (seg.final) {
@@ -3254,7 +3307,7 @@
           } else {
             addMsg(role, seg.text);
           }
-          if (isAI) checkStage(seg.text);
+          if (isAI) { checkStage(seg.text); armGreetNudge(); }
         } else {
           if (interim[seg.id]) interim[seg.id].querySelector('.bubble').textContent = seg.text;
           else interim[seg.id] = addMsg(role, seg.text, true);
@@ -3269,6 +3322,7 @@
       const input = document.getElementById('cinput');
       const text = input.value.trim();
       if (!text) return;
+      cancelGreetNudge();   // typing engages the interview — no need to nudge (Issue 3)
 
       // Show in chat immediately
       addMsg('you', text);
@@ -3557,6 +3611,7 @@
         room = new LivekitClient.Room({ rtcConfig: { iceTransportPolicy: 'relay' } });
 
         room.on(LivekitClient.RoomEvent.Connected, () => {
+          connectedAt = Date.now();   // startup grace baseline (Issue 1)
           document.getElementById('overlay').classList.remove('show');
           document.getElementById('start-wrap').style.display = 'none';
           document.getElementById('input-wrap').style.display = 'block';
@@ -3567,7 +3622,7 @@
           document.querySelector('.btn-send').disabled = false;
           setConnLabel('Online');
           startTimer();
-          addMsg('sys', 'Secure session established. Sarah will begin shortly.');
+          startProgress();   // rotating "getting ready…" messages until Sarah speaks (Issue 2)
           showTyping();
           setAvatarMode('thinking');
         });
@@ -3578,13 +3633,18 @@
         room.on(LivekitClient.RoomEvent.Reconnecting, () => {
           setConnLabel('Reconnecting…');
           setAvatarMode('thinking');
-          addMsg('sys', 'Connection unstable — reconnecting…');
+          // Issue 1 — during startup the agent + avatar joining triggers a benign
+          // ICE renegotiation that looks like a reconnect. Only alarm the candidate
+          // for a GENUINE mid-interview drop (past the startup grace window).
+          if (Date.now() - connectedAt > STARTUP_GRACE)
+            addMsg('sys', 'Connection unstable — reconnecting…');
         });
 
         room.on(LivekitClient.RoomEvent.Reconnected, () => {
           setConnLabel('Online');
           setAvatarMode('idle');
-          addMsg('sys', 'Reconnected. The interview continues.');
+          if (Date.now() - connectedAt > STARTUP_GRACE)
+            addMsg('sys', 'Reconnected. The interview continues.');
         });
 
         // ── Full disconnect ──────────────────────────────────────────────────────
