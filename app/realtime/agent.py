@@ -71,6 +71,21 @@ if _DG_TTS_SPEED != 1.0:
         logger.warning(f"[tts] could not enable Deepgram speed override (non-fatal): {_e}")
 
 
+# ── Candidate-join wait ────────────────────────────────────────────────────────
+# The interview room is created at TRIGGER time (services/context_builder.py) and
+# this worker uses AUTOMATIC dispatch (no agent_name in WorkerOptions), so LiveKit
+# hands us a job the moment the room exists — long before the candidate opens the
+# link that was emailed to them. The entrypoint therefore waits for the candidate
+# instead of interviewing an empty room. If nobody arrives within this window the
+# job exits quietly WITHOUT finalizing (see the guard in on_shutdown), and the
+# interview stays "scheduled" so the join link keeps working. When the candidate
+# does open the link later, LiveKit re-creates the room and dispatches a fresh job.
+#
+# Keep this comfortably above room_manager's empty_timeout (30s) so room closure,
+# not this timeout, is the usual way an unattended job ends.
+CANDIDATE_JOIN_TIMEOUT = float(os.getenv("CANDIDATE_JOIN_TIMEOUT_SECONDS", "60"))
+
+
 # ── Base system prompt ─────────────────────────────────────────────────────────
 
 BASE_SYSTEM_PROMPT = """You are a professional HR interviewer conducting an L1 screening call.
@@ -899,6 +914,31 @@ async def entrypoint(ctx: JobContext):
     # ── Shutdown callback ──────────────────────────────────────────────────────
     async def on_shutdown() -> None:
         avatar_watchdog.stop()
+
+        # ── GUARD: never finalize an interview the candidate did not attend ────
+        # This job can end without anyone joining (dispatched at trigger time,
+        # room emptied, worker restart). Previously this callback unconditionally
+        # wrote status="completed", so the candidate's join link reported
+        # "interview already completed" before they had attended — and an
+        # evaluation + report were generated from an empty transcript.
+        #
+        # interview_start_time[0] is set only when the candidate actually joins
+        # (on_participant_connected), so it is the authoritative attendance
+        # signal. When absent, leave the status untouched: "scheduled" keeps the
+        # link working, and a genuinely abandoned "in_progress" row is finalized
+        # later by recover_stuck_interviews / expire_abandoned_interviews.
+        if interview_start_time[0] is None:
+            logger.info(
+                "[shutdown] no candidate attendance — status left unchanged "
+                "(no completion, no evaluation, no report)",
+                extra={"interview_id": interview_id, "room": room_name},
+            )
+            try:
+                await recorder.stop()
+            except Exception:
+                pass
+            return
+
         if interview_id and tenant_id:
             end_time = datetime.now(timezone.utc)
             start    = interview_start_time[0]
@@ -1144,6 +1184,56 @@ async def entrypoint(ctx: JobContext):
         # If they don't come back, _finalize_after_grace() runs ctx.shutdown(),
         # which marks completed, drains transcripts, and runs evaluation.
         grace_timer.candidate_left()
+
+    # ── Wait for the candidate before ANY expensive setup ─────────────────────
+    # See CANDIDATE_JOIN_TIMEOUT: this job may have been dispatched at trigger
+    # time, with the candidate still hours away from clicking their link. Without
+    # this wait the agent greeted an empty room, burned a Simli/TTS session, and
+    # then shut down — which stamped the interview "completed" so the join link
+    # reported "interview already completed" before the candidate ever attended.
+    #
+    # Placement matters: AFTER the participant handlers above (so a candidate who
+    # arrives during the wait is picked up by on_participant_connected) and BEFORE
+    # the VAD / AgentSession / avatar setup below (so nothing is spun up for a
+    # room nobody joins).
+    if interview_id:
+        _candidate_identity = f"candidate-{interview_id}"
+        _participant = None
+        try:
+            _participant = await asyncio.wait_for(
+                ctx.wait_for_participant(identity=_candidate_identity),
+                timeout=CANDIDATE_JOIN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                f"[join-wait] no candidate within {CANDIDATE_JOIN_TIMEOUT:.0f}s — "
+                "ending job WITHOUT finalizing; interview stays joinable",
+                extra={"interview_id": interview_id, "room": room_name},
+            )
+            return
+        except Exception as e:
+            # Never let a wait failure block a real interview — fall through and
+            # let the normal participant handlers drive the session.
+            logger.warning(
+                f"[join-wait] wait_for_participant failed ({e}) — continuing anyway",
+                extra={"interview_id": interview_id},
+            )
+
+        # wait_for_participant returns IMMEDIATELY when the candidate is already
+        # in the room — which is the normal case once the room is (re)created by
+        # the candidate joining. rtc.Room only fires participant_connected for
+        # participants arriving AFTER we connect, so that path would otherwise
+        # skip the in_progress write and leave interview_start_time unset (which
+        # the on_shutdown guard reads as "never attended"). Run it explicitly.
+        if _participant is not None and interview_start_time[0] is None:
+            logger.info(
+                "[join-wait] candidate already present at job start — "
+                "running join handler explicitly",
+                extra={"interview_id": interview_id},
+            )
+            on_participant_connected(_participant)
+
+    _lap("candidate present")
 
     # ── VAD: reuse the model prewarmed at worker boot ─────────────────────────
     # Fallback to loading it here if prewarm didn't run (e.g. an execution mode
