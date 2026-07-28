@@ -139,12 +139,16 @@ async def integration_results(
     extracted data) for a candidate+job. If the interview isn't finished yet,
     returns ready=false with the current status so the ATS can poll.
     """
+    # A candidate+job can have MORE than one export row — a re-triggered
+    # interview, a regenerated report, or the recovery jobs re-running export all
+    # append a fresh row. Take the most recent (by exported_at) rather than
+    # scalar_one_or_none(), which raises MultipleResultsFound on duplicates.
     row = (await db.execute(
         select(AtsInterviewResult).where(
             AtsInterviewResult.ats_candidate_id == body.candidate_id,
             AtsInterviewResult.ats_job_id == body.job_id,
-        )
-    )).scalar_one_or_none()
+        ).order_by(AtsInterviewResult.exported_at.desc())
+    )).scalars().first()
 
     if row is not None:
         return _serialize_result(row)

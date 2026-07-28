@@ -79,6 +79,12 @@ Required JSON structure:
   "weaknesses":             ["<point>", ...],
   "red_flags":              ["<flag>" | empty list],
   "summary":                "<3-5 sentence recruiter-ready paragraph>",
+  "score_rationale": {
+    "communication": "<one sentence citing transcript evidence for the communication score>",
+    "confidence":    "<one sentence citing transcript evidence for the confidence score>",
+    "jd_fit":        "<one sentence citing transcript evidence for the JD-fit score>",
+    "behavioral":    "<one sentence citing transcript evidence for the behavioral score>"
+  },
   "extracted": {
     "current_company":        "<string | null>",
     "current_role":           "<string | null>",
@@ -99,6 +105,9 @@ Scoring guidelines:
   confidence_score     — certainty, directness, lack of hesitation (1=very hesitant, 10=confident)
   jd_fit_score         — alignment with job requirements and critical skills (1=poor, 10=perfect)
   behavioral_score     — professionalism, stability signals, attitude (1=concerning, 10=exemplary)
+  score_rationale      — for EACH of the four dimensions, ONE concise sentence (max ~20 words)
+                          citing the specific transcript evidence that drove that score.
+                          Recruiter-facing; do NOT restate the numeric score.
   overall_score        — a weighted composite of the four dimensions plus the ATS
                           pre-score. The exact weights are ROLE-DEPENDENT and are
                           applied by the system in code, so give your best estimate

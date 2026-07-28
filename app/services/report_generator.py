@@ -121,41 +121,132 @@ def _render_html(d: dict) -> str:
     highlights = d.get("transcript_highlights", [])
     rec_label, rec_color = _rec_badge(d.get("recommendation"))
     overall    = d.get("overall_score")
+    # Per-dimension AI rationale (Phase 2) — one sentence each, saved by the
+    # evaluation engine into raw_extraction. Empty dict for pre-feature interviews.
+    score_rationale = d.get("score_rationale") or {}
 
-    # ── Role-tuned scoring weights (optional — null for pre-feature interviews) ──
+    # ── Scoring weights — plain-language "how this score was weighted" card ──────
+    # A separated light-grey card that explains, in recruiter-friendly terms, how
+    # much each factor counted toward the /100. Weights may be null for pre-feature
+    # interviews — the whole card is then omitted.
     weights_doc = d.get("evaluation_weights") or {}
     w           = weights_doc.get("weights") or {}
     _wlabels    = [("JD Fit", "jd_fit"), ("Communication", "communication"),
                    ("Behavioral", "behavioral"), ("Confidence", "confidence"), ("ATS", "ats")]
-    weight_chips = "".join(
-        f'<span class="wchip">{lbl} <b>{w.get(key)}%</b></span>'
-        for lbl, key in _wlabels if w.get(key) is not None
-    )
-    role_cat  = (weights_doc.get("role_category") or "").replace("_", " ").title()
+    # Plain-English meaning of each factor, so nobody has to guess what it measures.
+    _wmeaning = {
+        "jd_fit":        "Match to the job's required skills &amp; experience",
+        "communication": "Clarity, fluency &amp; articulation",
+        "behavioral":    "Professionalism, attitude &amp; stability",
+        "confidence":    "Certainty &amp; directness in answers",
+        "ats":           "Resume pre-screening score",
+    }
+    _wvals = {key: w.get(key) for _, key in _wlabels if w.get(key) is not None}
+    _wmax  = max(_wvals.values()) if _wvals else 0
+
+    weight_rows = ""
+    for lbl, key in _wlabels:
+        val = w.get(key)
+        if val is None:
+            continue
+        is_top = (_wmax and val == _wmax)
+        bar_w  = round(val / _wmax * 100) if _wmax else 0
+        weight_rows += f"""
+        <div class="wrow">
+          <div><div class="wr-name">{lbl}</div><div class="wr-mean">{_wmeaning.get(key, "")}</div></div>
+          <div class="wr-track"><div class="wr-fill{' top' if is_top else ''}" style="width:{bar_w}%"></div></div>
+          <div class="wr-pct{' top' if is_top else ''}">{val}%</div>
+        </div>"""
+
+    role_cat    = (weights_doc.get("role_category") or "").replace("_", " ").title()
     w_rationale = weights_doc.get("rationale") or ""
-    tuned     = weights_doc.get("source") == "llm"
+    tuned       = weights_doc.get("source") == "llm"
+    _wpill      = ('<span class="wc-pill">&#10024; Auto-tuned for this role</span>'
+                  if tuned else '<span class="wc-pill">Standard weights</span>')
+    _wrole      = f"For a <b>{role_cat}</b> role, " if role_cat else "For this role, "
     weights_section = ""
-    if weight_chips:
+    if weight_rows:
         weights_section = f"""
     <div class="section">
-      <div class="section-title">Scoring Weights {'&mdash; role-tuned' if tuned else '(standard)'}</div>
-      <div class="wchips">{weight_chips}</div>
-      {f'<p class="wrole">Role profile: <b>{role_cat}</b></p>' if role_cat else ''}
-      {f'<p class="summary-text" style="margin-top:6px">{w_rationale}</p>' if w_rationale else ''}
+      <div class="wcard">
+        <div class="wc-head">
+          <span class="wc-title">How This Score Was Weighted</span>
+          {_wpill}
+        </div>
+        <div class="wc-sub">The final <b>/100</b> score isn't one-size-fits-all. {_wrole}these factors counted as follows:</div>
+        {weight_rows}
+        {f'<div class="wc-why"><div class="wc-why-h">&#128161; Why these weights</div><p>{w_rationale}</p></div>' if w_rationale else ''}
+      </div>
     </div>"""
 
-    def score_bar(label: str, val: int | None, key: str) -> str:
-        v   = val or 0
-        col = _score_colour(val)
-        pct = v * 10
+    # Standard weights fallback so weight/contribution always render, even for
+    # pre-feature interviews whose evaluation_weights document is null.
+    _STD_W = {"jd_fit": 35, "communication": 25, "behavioral": 15, "confidence": 15}
+
+    def _esc(s) -> str:
+        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _dim_signals(key: str) -> str:
+        """Dimension-specific signals from data already loaded — no new queries."""
+        vf = (voice.get("features") or {}) if voice else {}
+        if key == "communication" and vf:
+            parts = []
+            if vf.get("pace_wpm") is not None:            parts.append(f"Pace <b>{vf['pace_wpm']} wpm</b>")
+            if vf.get("within_pause_ratio") is not None:  parts.append(f"Hesitation <b>{round(vf['within_pause_ratio'] * 100)}%</b>")
+            if vf.get("filler_per_100w") is not None:      parts.append(f"Filler <b>{vf['filler_per_100w']} /100w</b>")
+            if vf.get("hnr_db") is not None:               parts.append(f"Clarity <b>{vf['hnr_db']} dB</b>")
+            if parts:
+                return '<div class="ac-sig"><b>Voice signals:</b> ' + " · ".join(parts) + "</div>"
+        if key == "confidence" and voice:
+            parts = []
+            if voice.get("delivery_score") is not None:    parts.append(f"Delivery <b>{voice['delivery_score']}/10</b>")
+            if vf.get("within_pause_ratio") is not None:   parts.append(f"Within-pause <b>{vf['within_pause_ratio']}</b>")
+            if parts:
+                return '<div class="ac-sig"><b>Voice signals:</b> ' + " · ".join(parts) + "</div>"
+        if key == "jd_fit":
+            skills = ((d.get("candidate_profile") or {}).get("skills")) or []
+            chips  = "".join(f'<span class="ac-chip">{_esc(s)}</span>' for s in skills[:6])
+            ats    = d.get("ats_score")
+            head   = f'<b>ATS pre-score:</b> {ats}/100 &nbsp; ' if ats is not None else ""
+            if chips:
+                return f'<div class="ac-sig">{head}<b>Skills:</b> {chips}</div>'
+            if head:
+                return f'<div class="ac-sig">{head}</div>'
+        if key == "behavioral" and strengths:
+            chips = "".join(f'<span class="ac-chip">{_esc(s)}</span>' for s in strengths[:3])
+            return f'<div class="ac-sig"><b>Linked strengths:</b> {chips}</div>'
+        return ""
+
+    def score_accordion(label: str, val: int | None, key: str, open_: bool = False) -> str:
+        v      = val or 0
+        col    = _score_colour(val)
+        pct    = v * 10
+        band   = "Strong" if v >= 8 else "Good" if v >= 6 else "Adequate" if v >= 4 else "Weak"
+        weight = w.get(key) or _STD_W.get(key)
+        contrib     = f"{v * weight / 10:.1f} / {weight}" if weight else "—"
+        weight_str  = f"{weight}%" if weight else "—"
+        signals     = _dim_signals(key)
+        rat         = str(score_rationale.get(key) or "").strip()
+        rat_html    = (f'<div class="ac-ai"><span class="ac-aitag">AI</span>'
+                       f'<span>{_esc(rat)}</span></div>') if rat else ""
         return f"""
-        <div class="score-row">
-          <span class="score-label">{label}</span>
-          <div class="bar-wrap">
-            <div class="bar-fill" style="width:{pct}%;background:{col};"></div>
+        <details class="score-acc"{' open' if open_ else ''}>
+          <summary>
+            <span class="score-label">{label}</span>
+            <div class="bar-wrap"><div class="bar-fill" style="width:{pct}%;background:{col};"></div></div>
+            <span class="score-val" style="color:{col}">{v}/10</span>
+            <svg class="ac-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+          </summary>
+          <div class="ac-body">
+            <div class="ac-stats">
+              <div class="ac-stat"><label>Weight</label><span>{weight_str}</span></div>
+              <div class="ac-stat"><label>Contributes</label><span>{contrib}</span></div>
+              <div class="ac-stat"><label>Band</label><span class="ac-band" style="color:{col}">{band}</span></div>
+            </div>
+            {signals}
+            {rat_html}
           </div>
-          <span class="score-val" style="color:{col}">{v}/10</span>
-        </div>"""
+        </details>"""
 
     def bullet_list(items: list, colour: str) -> str:
         if not items:
@@ -275,6 +366,28 @@ def _render_html(d: dict) -> str:
   .bar-fill{{height:100%;border-radius:4px;transition:width .4s;}}
   .score-val{{width:38px;text-align:right;font-size:12px;font-weight:700;}}
 
+  /* Score-breakdown accordion */
+  .sb-hint{{font-size:10px;font-weight:600;color:#94A3B8;text-transform:none;letter-spacing:0;}}
+  .score-acc{{border:1px solid #E2E8F0;border-radius:10px;margin-bottom:8px;background:#fff;overflow:hidden;}}
+  .score-acc[open]{{border-color:#BFDBFE;box-shadow:0 4px 14px rgba(37,99,235,.07);}}
+  .score-acc summary{{list-style:none;cursor:pointer;padding:11px 14px;display:flex;align-items:center;gap:12px;}}
+  .score-acc summary::-webkit-details-marker{{display:none;}}
+  .score-acc summary:hover{{background:#F8FAFC;}}
+  .ac-chev{{width:15px;height:15px;flex-shrink:0;color:#94A3B8;transition:transform .2s;}}
+  .score-acc[open] .ac-chev{{transform:rotate(180deg);color:#2563EB;}}
+  .ac-body{{padding:2px 14px 14px;}}
+  .ac-stats{{display:flex;gap:9px;margin:6px 0 10px;flex-wrap:wrap;}}
+  .ac-stat{{background:#F8FAFC;border:1px solid #EEF2F7;border-radius:8px;padding:7px 11px;min-width:90px;}}
+  .ac-stat label{{display:block;font-size:9px;font-weight:700;color:#64748B;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;}}
+  .ac-stat span{{font-size:12.5px;font-weight:700;color:#0F172A;}}
+  .ac-band{{font-weight:800;}}
+  .ac-sig{{font-size:12px;color:#475569;line-height:1.7;margin-bottom:9px;}}
+  .ac-sig b{{color:#0F172A;font-weight:600;}}
+  .ac-chip{{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;background:#EFF6FF;color:#2563EB;margin:2px 3px 2px 0;}}
+  .ac-ai{{display:flex;gap:8px;align-items:flex-start;background:#F5F8FF;border:1px solid #DBEAFE;border-left:3px solid #2563EB;border-radius:8px;padding:9px 11px;}}
+  .ac-aitag{{flex-shrink:0;font-size:9px;font-weight:800;letter-spacing:.5px;background:#2563EB;color:#fff;padding:3px 7px;border-radius:5px;}}
+  .ac-ai span:last-child{{font-size:12.5px;color:#334155;line-height:1.55;}}
+
   /* Two-column grid */
   .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:20px;}}
 
@@ -317,6 +430,29 @@ def _render_html(d: dict) -> str:
   .wrole{{font-size:12px;color:#64748B;margin-top:8px;}}
   .wrole b{{color:#0F172A;}}
 
+  /* Scoring-weights card — separated light-grey callout, plain language */
+  .wcard{{background:linear-gradient(160deg,#EDF1F7 0%,#DFE6EF 100%);border:1px solid #CBD5E1;
+          border-radius:14px;padding:20px 22px;box-shadow:inset 0 1px 0 rgba(255,255,255,.6);}}
+  .wc-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap;}}
+  .wc-title{{font-size:15px;font-weight:800;letter-spacing:-.2px;color:#0F172A;}}
+  .wc-pill{{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;
+            background:#EFF6FF;color:#2563EB;border:1px solid #BFDBFE;padding:4px 11px;border-radius:999px;}}
+  .wc-sub{{font-size:12.5px;color:#475569;line-height:1.6;margin-bottom:16px;}}
+  .wc-sub b{{color:#0F172A;font-weight:600;}}
+  .wrow{{display:grid;grid-template-columns:132px 1fr 44px;align-items:center;gap:14px;margin-bottom:12px;}}
+  .wr-name{{font-size:12.5px;font-weight:700;color:#1E293B;}}
+  .wr-mean{{font-size:10.5px;color:#64748B;font-weight:500;margin-top:1px;line-height:1.3;}}
+  .wr-track{{height:9px;background:#D2DAE5;border-radius:5px;overflow:hidden;}}
+  .wr-fill{{height:100%;border-radius:5px;background:linear-gradient(90deg,#3B82F6,#60A5FA);}}
+  .wr-fill.top{{background:linear-gradient(90deg,#2563EB,#3B82F6);}}
+  .wr-pct{{font-size:14px;font-weight:800;text-align:right;color:#334155;font-variant-numeric:tabular-nums;}}
+  .wr-pct.top{{color:#2563EB;}}
+  .wc-why{{margin-top:16px;background:#fff;border:1px solid #E2E8F0;border-left:3px solid #60A5FA;
+           border-radius:9px;padding:12px 14px;}}
+  .wc-why-h{{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:800;color:#2563EB;
+             text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;}}
+  .wc-why p{{font-size:12.5px;color:#334155;line-height:1.65;}}
+
   /* Footer */
   .footer{{background:#F8FAFC;border-top:1px solid #E2E8F0;padding:14px 36px;
            display:flex;justify-content:space-between;font-size:10.5px;color:#94A3B8;}}
@@ -334,6 +470,10 @@ def _render_html(d: dict) -> str:
     body{{background:#fff;}}
     .page{{margin:0;border-radius:0;box-shadow:none;}}
     .print-bar{{display:none !important;}}
+    /* keep every score panel expanded + intact in the PDF */
+    .score-acc{{break-inside:avoid;border-color:#E2E8F0 !important;box-shadow:none !important;}}
+    .ac-body{{display:block !important;}}
+    .ac-chev{{display:none;}}
   }}
 </style>
 </head>
@@ -342,7 +482,7 @@ def _render_html(d: dict) -> str:
 
   <!-- Print / PDF bar -->
   <div class="print-bar">
-    <button class="btn-pdf" onclick="window.print()">
+    <button class="btn-pdf" onclick="document.querySelectorAll('.score-acc').forEach(function(x){{x.open=true;}});window.print();">
       <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2"/>
         <rect x="6" y="14" width="12" height="8"/>
@@ -397,11 +537,11 @@ def _render_html(d: dict) -> str:
 
     <!-- Score breakdown -->
     <div class="section">
-      <div class="section-title">Score Breakdown</div>
-      {score_bar("Communication",  scores.get("communication"), "communication")}
-      {score_bar("Confidence",     scores.get("confidence"),    "confidence")}
-      {score_bar("JD Fit",         scores.get("jd_fit"),        "jd_fit")}
-      {score_bar("Behavioral",     scores.get("behavioral"),    "behavioral")}
+      <div class="section-title">Score Breakdown <span class="sb-hint">click a row for details ▾</span></div>
+      {score_accordion("JD Fit",        scores.get("jd_fit"),        "jd_fit", open_=True)}
+      {score_accordion("Communication", scores.get("communication"), "communication")}
+      {score_accordion("Behavioral",    scores.get("behavioral"),    "behavioral")}
+      {score_accordion("Confidence",    scores.get("confidence"),    "confidence")}
     </div>
 {weights_section}
 {voice_section}
@@ -568,6 +708,7 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         # Voice & delivery analysis (only present for voice-weighted roles with audio)
         "voice_analysis": raw.get("voice_analysis"),
         "summary":        summary,
+        "score_rationale": raw.get("score_rationale") or {},
         "strengths":      strengths,
         "weaknesses":     weaknesses,
         "red_flags":      red_flags,
