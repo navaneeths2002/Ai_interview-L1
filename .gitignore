@@ -21,3 +21,6 @@ alembic/versions/*.py
 ngrok.exe
 
 knowledge_graph.html
+
+# Internal debugging log (not for the repo)
+DEBUGGING_NOTES.md

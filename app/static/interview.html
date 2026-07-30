@@ -3817,7 +3817,13 @@
           showInterviewOver(data.status, data.candidate_name);
           return;
         }
-        room = new LivekitClient.Room({ rtcConfig: { iceTransportPolicy: 'relay' } });
+        // ICE policy: use the DEFAULT ('all') so the browser can connect DIRECTLY
+        // (host / STUN) *and* fall back to TURN relay. The old 'relay'-only setting
+        // forced every candidate through TURN with no direct fallback — if the relay
+        // path failed on a device/network, the connection died with no alternative
+        // (worked on the dev machine, failed when shared). 'all' tries every path and
+        // lets ICE pick whichever connects — maximises success across candidate devices.
+        room = new LivekitClient.Room();
 
         room.on(LivekitClient.RoomEvent.Connected, () => {
           connectedAt = Date.now();   // startup grace baseline (Issue 1)
@@ -3951,7 +3957,19 @@
         document.getElementById('startBtn').disabled = false;
         document.getElementById('overlay').classList.remove('show');
         setAvatarMode('idle');
-        addMsg('sys', 'Connection failed: ' + err.message);
+        // Build a detailed, human-readable reason and surface it UNMISSABLY so a
+        // tester on ANY device (incl. phones with no DevTools) can read and report
+        // the exact WebRTC/room failure instead of us guessing.
+        const detail =
+          (err && err.name ? err.name + ': ' : '') +
+          (err && err.message ? err.message : String(err)) +
+          '  [secure=' + (window.isSecureContext ? 'yes' : 'NO') +
+          ', wss=' + (typeof data !== 'undefined' && data.livekit_url ? data.livekit_url : '?') + ']';
+        addMsg('sys', '⚠ Connection failed — ' + detail);
+        try {
+          alert('Interview connection failed.\n\n' + detail +
+                '\n\nPlease screenshot this message and send it back.');
+        } catch (e) { /* alert blocked — chat message still shows it */ }
       }
     }
 

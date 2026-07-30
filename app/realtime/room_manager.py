@@ -17,7 +17,15 @@ async def create_interview_room(interview_id: str) -> str:
         await lk.room.create_room(
             CreateRoomRequest(
                 name=room_name,
-                empty_timeout=30,    # close room 30s after last participant leaves
+                # Was 30s — but the room is created at TRIGGER time and the candidate
+                # needs to load the page, pass the readiness checks and grant the mic
+                # before they actually join, which was observed to take ~20–32s. With
+                # a 30s window a slightly-slow candidate arrived to an already-closed
+                # room ("room disconnected while waiting for participant"). 180s keeps
+                # the room alive comfortably longer than the agent's join wait
+                # (CANDIDATE_JOIN_TIMEOUT, default 60s) so the agent is still present
+                # whenever the candidate lands.
+                empty_timeout=180,   # close room 180s after it's empty
                 max_participants=3,  # agent + candidate + simli-avatar
             )
         )

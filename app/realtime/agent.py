@@ -83,7 +83,7 @@ if _DG_TTS_SPEED != 1.0:
 #
 # Keep this comfortably above room_manager's empty_timeout (30s) so room closure,
 # not this timeout, is the usual way an unattended job ends.
-CANDIDATE_JOIN_TIMEOUT = float(os.getenv("CANDIDATE_JOIN_TIMEOUT_SECONDS", "60"))
+CANDIDATE_JOIN_TIMEOUT = float(os.getenv("CANDIDATE_JOIN_TIMEOUT_SECONDS", "180"))
 
 
 # ── Base system prompt ─────────────────────────────────────────────────────────
@@ -1212,12 +1212,28 @@ async def entrypoint(ctx: JobContext):
             )
             return
         except Exception as e:
-            # Never let a wait failure block a real interview — fall through and
-            # let the normal participant handlers drive the session.
             logger.warning(
-                f"[join-wait] wait_for_participant failed ({e}) — continuing anyway",
+                f"[join-wait] wait_for_participant failed ({e})",
                 extra={"interview_id": interview_id},
             )
+            # If the ROOM itself is gone (it emptied out and closed while we were
+            # waiting), there is nothing to run. Exit cleanly instead of falling
+            # through into VAD / AgentSession / avatar setup on a DEAD room — that
+            # path hangs the entrypoint ("did not exit in time"), the worker
+            # force-kills the process, and repeated force-kills drive worker load
+            # to capacity so it stops dispatching agents to new interviews.
+            try:
+                _room_alive = ctx.room.isconnected()
+            except Exception:
+                _room_alive = False
+            if not _room_alive:
+                logger.info(
+                    "[join-wait] room no longer connected — ending job cleanly "
+                    "(no hang, no force-kill)",
+                    extra={"interview_id": interview_id, "room": room_name},
+                )
+                return
+            # Room still alive → fall through and let the participant handlers drive it.
 
         # wait_for_participant returns IMMEDIATELY when the candidate is already
         # in the room — which is the normal case once the room is (re)created by
