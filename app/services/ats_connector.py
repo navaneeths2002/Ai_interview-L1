@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -55,12 +57,26 @@ logger = logging.getLogger(__name__)
 # The one table we're granted read-only access to.
 ATS_TABLE = "AiInterviewScheduleDetails"
 
-# ── keys INSIDE JobDetailsJsonData (job basics) ─────────────────────────────────
-JD_TITLE_KEY   = "JOB_TITLE"
-JD_DESC_KEY    = "JOB_DESCRIPTION"
-JD_REQ_KEY     = "REQUIREMENTS"
-JD_DEPT_KEY    = "Department"     # present in fuller job rows; absent here → ""
-JD_CITY_KEY    = "CITY"
+# ── keys INSIDE JobDetailsJsonData (verified against the ATS's actual JSON) ──────
+# The ATS uses CamelCase keys (JobTitle / JobDescription / City …), NOT the
+# SCREAMING_CASE originally assumed — the old keys silently returned empty, so every
+# interview ran with a blank job title / description / location.
+JD_TITLE_KEY = "JobTitle"
+JD_DESC_KEY  = "JobDescription"
+JD_DEPT_KEY  = "Department"
+JD_CITY_KEY  = "City"
+JD_CRIT_KEY  = "CriticalSkills"
+JD_OPT_KEY   = "OptionalSkills"
+JD_SOFT_KEY  = "SoftSkills"
+JD_EXP_KEY   = "Experience"
+
+# Client domain URL → tenant. The ATS supplies a client domain URL to identify the
+# organisation (replacing the earlier ORG_ID plan). Exact field name is not yet
+# finalised, so we check several likely keys — CONFIRM THE KEY WITH THE ATS TEAM.
+JD_DOMAIN_KEYS = (
+    "ClientDomainUrl", "ClientDomainURL", "ClientDomain",
+    "ClientUrl", "DomainUrl", "client_domain_url", "client_domain", "domain_url",
+)
 
 
 class ATSDataError(Exception):
@@ -122,36 +138,87 @@ def _clean(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _split_skills(value: Any) -> list[str]:
+    """Skills arrive as a delimited string ('Python, Docker; SQL') or a list."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    s = _clean(value)
+    if not s:
+        return []
+    return [p.strip() for p in re.split(r"[,;|\n]+", s) if p.strip()]
+
+
+def _parse_years(value: Any) -> int:
+    """Pull a whole-number year count out of an Experience string ('3', '3 yrs')."""
+    m = re.search(r"\d+(?:\.\d+)?", _clean(value))
+    return int(float(m.group())) if m else 0
+
+
+def _strip_html(value: Any) -> str:
+    """JobDescription is HTML — reduce it to clean text for the strategy prompt."""
+    s = _clean(value)
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = (s.replace("&nbsp;", " ").replace("&amp;", "&")
+           .replace("&lt;", "<").replace("&gt;", ">"))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _normalize_domain_to_tenant(raw: Any) -> str:
+    """
+    Normalise a client domain URL into a valid tenant id (host only). Must satisfy
+    TenantMiddleware's ^[a-zA-Z0-9_\\-\\.]{3,64}$ — strips scheme / path / 'www.'.
+    e.g. 'https://acme.hrms.com/portal' → 'acme.hrms.com'.
+    """
+    s = _clean(raw)
+    if not s:
+        return ""
+    if "://" not in s:
+        s = "//" + s
+    try:
+        host = (urlparse(s).hostname or "").lower().strip()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    host = re.sub(r"[^a-z0-9_.\-]", "", host)
+    return host[:64]
+
+
 def _derive_tenant_id(job: dict) -> str:
     """
-    Tenant = the ATS organisation, so each org's interview data stays grouped.
-    ORG_ID lives inside JobDetailsJsonData. Falls back to 'ats-default' if absent.
+    Tenant = the ATS client, identified by their client domain URL (e.g.
+    'acme.hrms.com'), normalised to a valid tenant id so each client's interview
+    data stays grouped. Read from any of JD_DOMAIN_KEYS. Falls back to 'ats-default'.
     """
-    org_id = (job or {}).get("ORG_ID")
-    org_id = str(org_id).strip() if org_id is not None else ""
-    return f"org-{org_id}" if org_id else "ats-default"
+    job = job or {}
+    for k in JD_DOMAIN_KEYS:
+        tenant = _normalize_domain_to_tenant(job.get(k))
+        if len(tenant) >= 3:            # TenantMiddleware requires 3–64 chars
+            logger.info(f"[ats-connector] tenant from client domain '{k}' → {tenant}")
+            return tenant
+    logger.warning("[ats-connector] no client domain url in job details — tenant=ats-default")
+    return "ats-default"
 
 
 def _build_job_input(job: dict, ats_job_id: str) -> JobInput:
-    """
-    Map JobDetailsJsonData → JobInput. Only job basics are present; skills /
-    salary / experience aren't in this table, so they default empty/0.
-    """
+    """Map JobDetailsJsonData → JobInput using the ATS's real key names."""
     job = job if isinstance(job, dict) else {}
-    jd_text = [t for t in (_clean(job.get(JD_DESC_KEY)), _clean(job.get(JD_REQ_KEY))) if t]
+    desc = _strip_html(job.get(JD_DESC_KEY))
     return JobInput(
         ats_job_id=str(ats_job_id),
         position_title=_clean(job.get(JD_TITLE_KEY)),
         department=_clean(job.get(JD_DEPT_KEY)),
         location=_clean(job.get(JD_CITY_KEY)),
         position_type="full_time",
-        min_experience_years=0,          # not carried in JobDetailsJsonData
-        critical_skills=[],              # not carried in JobDetailsJsonData
-        optional_skills=[],
-        soft_skills=[],
+        min_experience_years=_parse_years(job.get(JD_EXP_KEY)),
+        critical_skills=_split_skills(job.get(JD_CRIT_KEY)),
+        optional_skills=_split_skills(job.get(JD_OPT_KEY)),
+        soft_skills=_split_skills(job.get(JD_SOFT_KEY)),
         salary_min=0,
         salary_max=0,
-        jd_text=jd_text,
+        jd_text=[desc] if desc else [],
     )
 
 
