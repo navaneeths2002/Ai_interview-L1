@@ -572,9 +572,17 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
     # ── 11. Save to DB ─────────────────────────────────────────────────────────
     await _save_results(db, interview, result)
 
-    # Record evaluation Claude token usage for per-interview cost tracking.
+    # Record evaluation Claude token usage for per-interview cost tracking, then
+    # finalize the cost breakdown. Finalizing HERE (not only in agent shutdown)
+    # means the recovery scheduler's re-run of evaluation also repairs the cost
+    # row for interviews whose worker shutdown was force-killed — no interview is
+    # left with usage-only / cost=NULL.
     from app.services import cost_tracker
     await cost_tracker.patch_usage(interview_id, str(interview.tenant_id), eval_usage)
+    try:
+        await cost_tracker.finalize_and_log(interview_id)
+    except Exception as e:
+        logger.warning(f"[cost] finalize after evaluation failed (non-fatal): {e}")
 
     logger.info(
         f"[eval] ✓ {interview_id} | "

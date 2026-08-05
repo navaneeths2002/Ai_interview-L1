@@ -445,7 +445,6 @@ class HRInterviewAgent(Agent):
         tenant_id:    str | None = None,
         job_context:  str = "",
     ) -> None:
-        super().__init__(instructions=BASE_SYSTEM_PROMPT)
         self._graph                          = build_interview_graph()
         self._graph_state: InterviewState    = graph_state
         self.interview_id                    = interview_id
@@ -454,9 +453,21 @@ class HRInterviewAgent(Agent):
         # LLM call so Sarah knows the job and can answer the candidate's questions.
         self._job_context                    = job_context or ""
         self._transcript_tasks: set[asyncio.Task] = set()
+        # Stage the NEXT assistant reply belongs to — snapshotted right after each
+        # graph advance so the conversation_item_added handler labels AI turns
+        # deterministically instead of racing a live read of mutable graph state.
+        self._pending_ai_stage: str | None   = None
+        # FIX RC1: give the framework the full initial prompt (base + role context
+        # + intro stage focus). NOTE: the old `instructions` PROPERTY override here
+        # never worked — livekit-agents copies agent.instructions into the chat
+        # context's system message ONCE at activity start and never re-reads it, so
+        # per-turn stage instructions silently never reached the LLM. The property
+        # is gone; every stage change now calls self.update_instructions() (the
+        # framework's documented API) via _sync_instructions().
+        super().__init__(instructions=self._build_prompt())
 
-    @property
-    def instructions(self) -> str:
+    def _build_prompt(self) -> str:
+        """Full system prompt for the CURRENT stage: base + role context + focus."""
         prompt = BASE_SYSTEM_PROMPT
         if self._job_context:
             prompt += "\n\n## ROLE CONTEXT\n" + self._job_context
@@ -469,6 +480,21 @@ class HRInterviewAgent(Agent):
                 "If the candidate has already answered, acknowledge and pivot cleanly."
             )
         return prompt
+
+    async def _sync_instructions(self) -> None:
+        """
+        Push the current stage's prompt into the live chat context (FIX RC1).
+        update_instructions() rewrites the system message the LLM actually sees.
+        Never allowed to break a turn — failures are logged and the turn continues
+        (the turn_ctx injection in on_user_turn_completed still carries the focus).
+        """
+        try:
+            await self.update_instructions(self._build_prompt())
+        except Exception as e:
+            logger.warning(
+                f"[graph] update_instructions failed (turn continues): {e}",
+                extra={"interview_id": self.interview_id},
+            )
 
     def _queue_save(self, speaker: str, text: str, node: str | None = None) -> None:
         if not self.interview_id:
@@ -531,7 +557,8 @@ class HRInterviewAgent(Agent):
             await self.session.say(random.choice(_MISHEAR), allow_interruptions=False)
             return
 
-        # Save candidate turn
+        # Save candidate turn — labeled with the PRE-advance stage: the answer
+        # belongs to the question that was just asked (FIX RC4 convention).
         self._queue_save("candidate", text, node=self._graph_state.get("stage"))
 
         # Advance LangGraph
@@ -547,6 +574,31 @@ class HRInterviewAgent(Agent):
             logger.error(
                 "LangGraph advance error",
                 extra={"interview_id": self.interview_id, "error": str(e)},
+            )
+
+        # FIX RC4: snapshot the stage the upcoming reply belongs to (post-advance)
+        # so the transcript handler doesn't race a live read of mutable state.
+        self._pending_ai_stage = self._graph_state.get("stage")
+
+        # FIX RC1 (persistent): rewrite the system message so this and all later
+        # generations see the CURRENT stage focus.
+        await self._sync_instructions()
+
+        # FIX RC1 (current turn, belt-and-braces): turn_ctx is the context used
+        # for THIS reply's generation (the documented per-turn injection hook) —
+        # place the stage focus directly into it in case the framework built the
+        # generation copy before update_instructions landed.
+        try:
+            stage_instr = self._graph_state.get("stage_instruction", "")
+            if stage_instr:
+                turn_ctx.add_message(
+                    role="system",
+                    content="CURRENT FOCUS for your next reply: " + stage_instr,
+                )
+        except Exception as e:
+            logger.warning(
+                f"[graph] turn_ctx focus injection failed (turn continues): {e}",
+                extra={"interview_id": self.interview_id},
             )
 
         # Natural pause
@@ -569,6 +621,11 @@ class HRInterviewAgent(Agent):
         if not text:
             return
 
+        # FIX RC5: typed answers were never saved to the transcript at all —
+        # this path had no _queue_save and the conversation_item_added handler
+        # only records assistant items. Same convention as voice: pre-advance stage.
+        self._queue_save("candidate", text, node=self._graph_state.get("stage"))
+
         try:
             new_state = await self._graph.ainvoke(
                 {**self._graph_state, "last_candidate_text": text}
@@ -582,6 +639,11 @@ class HRInterviewAgent(Agent):
                 "LangGraph advance error (typed)",
                 extra={"interview_id": self.interview_id, "error": str(e)},
             )
+
+        # FIX RC4 + RC1 — same as the voice path: snapshot the reply's stage,
+        # then push the new stage focus into the live chat context.
+        self._pending_ai_stage = self._graph_state.get("stage")
+        await self._sync_instructions()
 
         await asyncio.sleep(random.uniform(0.3, 0.6))
 
@@ -987,21 +1049,14 @@ async def entrypoint(ctx: JobContext):
                     extra={"interview_id": interview_id},
                 )
 
-            try:
-                from app.services.evaluation_engine import run_evaluation
-                await run_evaluation(interview_id)
-                logger.info(
-                    "Post-interview evaluation complete",
-                    extra={"interview_id": interview_id},
-                )
-            except Exception as e:
-                logger.error(
-                    "Post-interview evaluation failed",
-                    extra={"interview_id": interview_id, "error": str(e)},
-                )
-
-            # ── Per-interview cost: record live usage → finalize → log to terminal ──
-            # Runs LAST so conversation + strategy + eval usage are all present.
+            # ── Per-interview cost: patch usage + baseline finalize BEFORE eval ──
+            # This used to run LAST, after run_evaluation — but the worker's
+            # shutdown_process_timeout force-killed the process mid-evaluation, so
+            # the cost write NEVER executed: interview_costs rows sat with
+            # usage-only, cost=NULL, total_usd=NULL ("cost analysis not working").
+            # Order now: write the conversation usage + a baseline cost FIRST
+            # (cheap, <1s), then run evaluation, then re-finalize to fold the eval
+            # tokens in. finalize is idempotent — it recomputes from merged usage.
             try:
                 s = usage_collector.get_summary()
                 await cost_tracker.patch_usage(interview_id, tenant_id, {
@@ -1015,7 +1070,32 @@ async def entrypoint(ctx: JobContext):
                 await cost_tracker.finalize_and_log(interview_id)
             except Exception as e:
                 logger.warning(
-                    f"[cost] finalize in shutdown failed (non-fatal): {e}",
+                    f"[cost] usage patch/baseline finalize failed (non-fatal): {e}",
+                    extra={"interview_id": interview_id},
+                )
+
+            try:
+                from app.services.evaluation_engine import run_evaluation
+                await run_evaluation(interview_id)
+                logger.info(
+                    "Post-interview evaluation complete",
+                    extra={"interview_id": interview_id},
+                )
+            except Exception as e:
+                logger.error(
+                    "Post-interview evaluation failed",
+                    extra={"interview_id": interview_id, "error": str(e)},
+                )
+
+            # Re-finalize so the evaluation Claude tokens are included in the
+            # stored breakdown. If the process is killed before reaching here,
+            # the baseline cost above already exists — and evaluation_engine's
+            # own finalize (recovery path included) refreshes it later.
+            try:
+                await cost_tracker.finalize_and_log(interview_id)
+            except Exception as e:
+                logger.warning(
+                    f"[cost] post-eval finalize failed (non-fatal): {e}",
                     extra={"interview_id": interview_id},
                 )
 
@@ -1367,10 +1447,17 @@ async def entrypoint(ctx: JobContext):
             if "assistant" in role_str:
                 ai_text = _extract_text(item).strip()
                 if ai_text:
-                    hr_agent._queue_save(
-                        "ai", ai_text,
-                        node=hr_agent._graph_state.get("stage"),
-                    )
+                    # FIX RC4: deterministic stage labeling.
+                    # - Fillers/mishear prompts are conversational noise, not stage
+                    #   content — label them "filler" so they stop polluting stages.
+                    # - Real replies get the stage snapshotted at graph-advance time
+                    #   (_pending_ai_stage), not a live read that races advances.
+                    if ai_text in _FILLERS or ai_text in _MISHEAR:
+                        node = "filler"
+                    else:
+                        node = (hr_agent._pending_ai_stage
+                                or hr_agent._graph_state.get("stage"))
+                    hr_agent._queue_save("ai", ai_text, node=node)
                 else:
                     logger.debug(
                         "[transcript] assistant item had no extractable text",
@@ -1432,6 +1519,13 @@ if __name__ == "__main__":
             entrypoint_fnc=entrypoint,
             # Loads the Silero VAD once at worker boot instead of per interview.
             prewarm_fnc=prewarm,
+            # Default is 10s — far too short for on_shutdown, which runs the
+            # Claude evaluation (10–30s+) inline. The force-kill at 10s was
+            # truncating shutdown mid-eval ("process did not exit in time",
+            # exit -10): cost finalize never ran and evaluation had to be
+            # rescued by the recovery scheduler. 120s lets a normal shutdown
+            # (eval + report chain + cost) finish in-process.
+            shutdown_process_timeout=120.0,
             api_key=os.environ["LIVEKIT_API_KEY"],
             api_secret=os.environ["LIVEKIT_API_SECRET"],
             ws_url=os.environ["LIVEKIT_URL"],

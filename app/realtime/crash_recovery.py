@@ -179,6 +179,11 @@ async def _save_stage(interview_id: str, graph_state: dict) -> None:
             "stage":          graph_state.get("stage", "intro"),
             "turns_in_stage": graph_state.get("turns_in_stage", 0),
             "captured":       {k: bool(graph_state.get(k)) for k in _CAPTURE_KEYS},
+            # FIX B/D: closed-loop tracking must survive a crash too — which
+            # questions were actually asked, and each stage's recorded outcome
+            # ("captured" | "not_disclosed").
+            "asked":          dict(graph_state.get("asked") or {}),
+            "outcomes":       dict(graph_state.get("stage_outcomes") or {}),
             "saved_at":       datetime.now(timezone.utc).isoformat(),
         }
     }
@@ -277,6 +282,23 @@ def apply_resume(graph_state: dict, resume: dict) -> dict:
     for key, value in (resume.get("captured") or {}).items():
         if key in graph_state:
             graph_state[key] = bool(value)
+
+    # FIX B/D: restore closed-loop tracking. Older saved payloads (pre-feature)
+    # have no asked/outcomes — derive sane values: any stage whose capture flag
+    # is True gets outcome "captured" (and was necessarily asked). Stages passed
+    # WITHOUT capture under the old force-advance get no outcome, so the wrap-up
+    # gate will loop back and collect them before the interview can complete.
+    asked    = dict(resume.get("asked") or {})
+    outcomes = dict(resume.get("outcomes") or {})
+    for flag_key, value in (resume.get("captured") or {}).items():
+        if value and flag_key.startswith("captured_"):
+            stage_name = flag_key[len("captured_"):]
+            outcomes.setdefault(stage_name, "captured")
+            asked.setdefault(stage_name, True)
+    # The re-greet re-asks the resumed stage's question.
+    asked[graph_state["stage"]] = True
+    graph_state["asked"]          = asked
+    graph_state["stage_outcomes"] = outcomes
 
     graph_state["stage_instruction"] = _make_instruction(graph_state["stage"], graph_state)
     return graph_state
