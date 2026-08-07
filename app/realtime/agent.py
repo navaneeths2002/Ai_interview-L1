@@ -28,7 +28,7 @@ _env_path = pathlib.Path(__file__).resolve().parent.parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path, override=False)
 
 from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli
-from livekit.agents import llm, metrics
+from livekit.agents import inference, llm, metrics
 from livekit.agents.voice import room_io
 from livekit.plugins import deepgram, anthropic, silero, simli
 from sqlalchemy import bindparam, text
@@ -116,6 +116,12 @@ Handling typed text and spelling corrections:
 - The candidate may type their response in a chat box instead of speaking — treat typed messages exactly like spoken ones
 - When the candidate spells out a name or word letter-by-letter (e.g. "Navaneeth — N-A-V-A-N-E-E-T-H"), confirm by saying "Got it — [assembled name], thank you"
 - When the candidate corrects a name, acknowledge naturally and use the corrected spelling going forward
+
+Handling overlaps and interruptions (follow these exactly):
+- Candidates often pause mid-answer to think. If a message looks unfinished (trails off, ends mid-sentence, or is only a fragment), do NOT treat it as complete — respond minimally or wait; never rush in with the next question.
+- If you and the candidate end up speaking at the same time, or you appear to have cut them off: stop, say something brief like "Sorry — please, go ahead", and let them finish. Do not talk over them.
+- After an overlap, do NOT restart or re-read your question from the beginning. Continue naturally from where the conversation actually is, and acknowledge whatever they said during the overlap.
+- If the candidate's answer arrives split across two messages, treat both parts as ONE answer — never answer the first fragment as if it were complete.
 """
 
 _FILLERS   = ["Hmm.", "Right.", "I see.", "Okay.", "Sure.", "Got it.", "Aha!", "Gotcha."]
@@ -678,6 +684,34 @@ def _build_vad():
         activation_threshold=0.40,      # less sensitive — noise/echo no longer trips it
         prefix_padding_duration=0.3,
     )
+
+
+def _build_turn_detector():
+    """
+    FIX A — semantic end-of-turn detection (built-in livekit inference service).
+
+    Pure-acoustic endpointing treated a candidate's THINKING pause ("My notice
+    period is… <1s>") as end-of-turn: Sarah started answering, the candidate
+    resumed, and the two talked over each other — fragmented turns, barge-in
+    chaos. The TurnDetector reads the live transcript and judges whether the
+    utterance is semantically COMPLETE: complete → respond at normal speed;
+    incomplete → keep waiting (bounded by max_endpointing_delay, 6s).
+
+    Runs on LiveKit's inference service using the LIVEKIT_* credentials already
+    in .env — no extra dependency, no model download. Fully guarded: if it can't
+    be constructed, we return None and the session falls back to the exact
+    acoustic behaviour we have today.
+    """
+    try:
+        det = inference.TurnDetector()
+        logger.info("[turn] semantic TurnDetector enabled")
+        return det
+    except Exception as e:
+        logger.warning(
+            f"[turn] TurnDetector unavailable — falling back to acoustic "
+            f"endpointing only: {e}"
+        )
+        return None
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -1345,7 +1379,15 @@ async def entrypoint(ctx: JobContext):
     _lap("vad ready")
 
     # ── AgentSession ──────────────────────────────────────────────────────────
+    # FIX A: semantic end-of-turn detection — when the candidate pauses mid-
+    # thought, the detector sees the utterance is incomplete and keeps waiting
+    # (up to max_endpointing_delay) instead of letting Sarah talk over them.
+    # None → param omitted → today's acoustic behaviour, unchanged.
+    _turn_det = _build_turn_detector()
+    _turn_kwargs = {"turn_detection": _turn_det} if _turn_det is not None else {}
+
     session = AgentSession(
+        **_turn_kwargs,
         vad=_vad,
         stt=deepgram.STT(
             api_key=os.environ["DEEPGRAM_API_KEY"],
