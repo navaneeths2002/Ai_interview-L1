@@ -400,6 +400,47 @@ async def _maybe_voice_analysis(interview, context, result: dict, turns: list) -
     )
 
 
+async def _maybe_speaker_check(interview, result: dict) -> None:
+    """
+    Voice Guard v1 (post-interview speaker check): detect whether a SECOND
+    distinct voice spoke in the candidate recording — the proxy-interview
+    fraud pattern. Mutates `result` in place:
+      • result["speaker_check"] — full analysis (voices, suspicious spans, …)
+      • result["red_flags"]    — appended when a second voice is detected
+    Silent to the candidate by design; surfaces only in the recruiter report.
+    Runs the CPU-bound embedding analysis in a worker thread. Non-fatal always.
+    """
+    import asyncio
+
+    wav_path = getattr(interview, "recording_s3_key", None)
+    if not wav_path or not os.path.exists(wav_path):
+        alt = os.path.join("recordings", f"{interview.id}.wav")
+        wav_path = alt if os.path.exists(alt) else None
+    if not wav_path:
+        logger.info(f"[speaker-check] no recording for {interview.id} — skipping")
+        return
+
+    from app.services.speaker_check import run_speaker_check
+    check = await asyncio.to_thread(run_speaker_check, wav_path)
+    if not check:
+        return
+
+    result["speaker_check"] = check
+    if check.get("speakers_detected", 1) >= 2:
+        spans = ", ".join(
+            f"{s['start']}-{s['end']}" for s in check.get("suspicious_spans", [])[:3]
+        )
+        result.setdefault("red_flags", []).append(
+            "Voice check: a second distinct voice was detected in the recording"
+            + (f" (around {spans})" if spans else "")
+            + " — possible impersonation; recommend manually reviewing the audio."
+        )
+        logger.warning(
+            f"[speaker-check] SECOND VOICE detected for {interview.id} "
+            f"(spans: {spans or 'n/a'})"
+        )
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 async def run_evaluation(interview_id: str) -> bool:
@@ -537,6 +578,14 @@ async def _run(db: AsyncSession, interview_id: str) -> bool:
         await _maybe_voice_analysis(interview, context, result, turns)
     except Exception as e:
         logger.warning(f"[voice] analysis step skipped for {interview_id}: {e}")
+
+    # ── 9.6 Speaker check (Voice Guard v1) ────────────────────────────────────
+    # Counts distinct voices in the recording; a second voice → red flag in the
+    # report (silent to the candidate by design). Fully non-fatal.
+    try:
+        await _maybe_speaker_check(interview, result)
+    except Exception as e:
+        logger.warning(f"[speaker-check] step skipped for {interview_id}: {e}")
 
     # ── 10. Override overall_score with the exact, ROLE-TUNED formula ─────────
     # Claude approximates the calculation. We recompute it precisely in code so

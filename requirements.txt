@@ -48,3 +48,6 @@ python-json-logger>=2.0.7  # Structured JSON logging
 praat-parselmouth>=0.4.7  # Praat acoustics: pitch, jitter, shimmer, HNR
 librosa>=0.10.0           # Loudness/energy dynamics, speech/silence split
 soundfile>=0.12.0         # WAV I/O backend for librosa
+
+# Phase 14 — Voice Guard v1 (post-interview speaker check / impersonation flag)
+sherpa-onnx>=1.13.0       # CAM++ speaker embeddings (ONNX, CPU) — model file in app/models_data/

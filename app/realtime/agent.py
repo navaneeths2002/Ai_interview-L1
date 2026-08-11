@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 _env_path = pathlib.Path(__file__).resolve().parent.parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path, override=False)
 
-from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, JobProcess, TurnHandlingOptions, WorkerOptions, cli
 from livekit.agents import inference, llm, metrics
 from livekit.agents.voice import room_io
 from livekit.plugins import deepgram, anthropic, silero, simli
@@ -1379,15 +1379,38 @@ async def entrypoint(ctx: JobContext):
     _lap("vad ready")
 
     # ── AgentSession ──────────────────────────────────────────────────────────
-    # FIX A: semantic end-of-turn detection — when the candidate pauses mid-
-    # thought, the detector sees the utterance is incomplete and keeps waiting
-    # (up to max_endpointing_delay) instead of letting Sarah talk over them.
-    # None → param omitted → today's acoustic behaviour, unchanged.
+    # Turn handling — migrated off the deprecated per-param API onto
+    # turn_handling=TurnHandlingOptions(...) (the 1.6.x replacement).
+    #
+    # interruption.mode="vad" (NOT "adaptive"): adaptive mode calls LiveKit's
+    # CLOUD barge-in classifier on EVERY vad trigger while Sarah speaks — echo
+    # and noise from no-headphone candidates machine-gunned that quota (the
+    # "37/45 concurrent barge in requests per minute" usage warnings). Local
+    # vad mode makes zero cloud barge requests; backchannel filtering is
+    # already done locally by min_words=6 ("yeah / hmm, okay" never commits an
+    # interruption) plus min_duration as a noise floor.
+    #
+    # turn_detection (FIX A): semantic end-of-turn detector — when the
+    # candidate pauses mid-thought, it keeps waiting (up to max_delay) instead
+    # of letting Sarah talk over them. None → key omitted → acoustic default.
     _turn_det = _build_turn_detector()
-    _turn_kwargs = {"turn_detection": _turn_det} if _turn_det is not None else {}
+    _turn_handling = TurnHandlingOptions(
+        endpointing={
+            "min_delay": 0.4,     # was min_endpointing_delay
+            "max_delay": 6.0,     # was max_endpointing_delay
+        },
+        interruption={
+            "enabled": True,      # was allow_interruptions=True
+            "mode": "vad",        # local decisions — no cloud barge quota
+            "min_words": 6,       # was min_interruption_words (Lever A)
+            "min_duration": 0.5,  # noise floor: breaths/taps never interrupt
+        },
+    )
+    if _turn_det is not None:
+        _turn_handling["turn_detection"] = _turn_det
 
     session = AgentSession(
-        **_turn_kwargs,
+        turn_handling=_turn_handling,
         vad=_vad,
         stt=deepgram.STT(
             api_key=os.environ["DEEPGRAM_API_KEY"],
@@ -1408,13 +1431,9 @@ async def entrypoint(ctx: JobContext):
             model="aura-2-vesta-en",   # Sarah — warm female Aura-2 voice
             sample_rate=24000,          # matches the room-audio fallback path
         ),
-        allow_interruptions=True,
-        # Lever A — require more real words before a barge-in stops Sarah mid-sentence.
-        # 4 words let a stray "uh, okay yeah right" (or an echo fragment) cut her off;
-        # 6 means it takes a deliberate utterance to interrupt.
-        min_interruption_words=6,
-        min_endpointing_delay=0.4,
-        max_endpointing_delay=6.0,
+        # interruption/endpointing config lives in turn_handling above — the old
+        # per-param equivalents (allow_interruptions, min_interruption_words,
+        # min/max_endpointing_delay) are deprecated and must not be mixed in.
         aec_warmup_duration=0,
     )
     # CRASH RECOVERY HOOK: let the reconnect handler reach the session for re-greeting

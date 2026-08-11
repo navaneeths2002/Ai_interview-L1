@@ -314,6 +314,34 @@ def _render_html(d: dict) -> str:
       <p class="muted" style="margin-top:8px;font-size:11px">Objective acoustic measurements, advisory only — interpret alongside the transcript; accents and audio quality can affect readings.</p>
     </div>"""
 
+    # ── Voice integrity (Voice Guard v1 — post-interview speaker check) ───────
+    sc = d.get("speaker_check") or {}
+    speaker_section = ""
+    if sc:
+        if sc.get("speakers_detected", 1) >= 2:
+            _spans = ", ".join(
+                f"{s.get('start','?')}&ndash;{s.get('end','?')}"
+                for s in (sc.get("suspicious_spans") or [])[:3]
+            )
+            speaker_section = f"""
+    <div class="section">
+      <div class="section-title">Voice Integrity</div>
+      <div style="display:flex;gap:10px;align-items:flex-start;background:#FEF2F2;border:1px solid #FECACA;border-left:3px solid #EF4444;border-radius:9px;padding:12px 14px;">
+        <span style="font-size:16px;">&#9888;&#65039;</span>
+        <div style="font-size:12.5px;color:#7F1D1D;line-height:1.6;">
+          <b>A second distinct voice was detected in the recording</b>{f" (around {_spans})" if _spans else ""}.
+          Possible impersonation &mdash; we recommend manually reviewing the audio before a decision.
+          <div class="muted" style="margin-top:4px;font-size:11px;color:#B91C1C;">Automated acoustic check ({sc.get('total_speech_seconds','—')}s of speech analyzed) — advisory, not conclusive.</div>
+        </div>
+      </div>
+    </div>"""
+        else:
+            speaker_section = f"""
+    <div class="section">
+      <div class="section-title">Voice Integrity</div>
+      <p style="font-size:12.5px;color:#166534;font-weight:500;">&#10003; Single voice verified throughout the interview ({sc.get('total_speech_seconds','—')}s of speech analyzed).</p>
+    </div>"""
+
     gen_at  = d.get("generated_at", "")
     dur_sec = d.get("duration_seconds")
     dur_str = f"{dur_sec // 60}m {dur_sec % 60}s" if dur_sec else "—"
@@ -545,6 +573,7 @@ def _render_html(d: dict) -> str:
     </div>
 {weights_section}
 {voice_section}
+{speaker_section}
 
     <!-- Executive summary -->
     <div class="section">
@@ -707,6 +736,8 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         "evaluation_weights": (context.evaluation_weights if context else None),
         # Voice & delivery analysis (only present for voice-weighted roles with audio)
         "voice_analysis": raw.get("voice_analysis"),
+        # Voice Guard v1 — post-interview distinct-voice check (None for old rows)
+        "speaker_check":  raw.get("speaker_check"),
         "summary":        summary,
         "score_rationale": raw.get("score_rationale") or {},
         "strengths":      strengths,
