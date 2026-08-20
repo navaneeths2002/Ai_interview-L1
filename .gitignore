@@ -24,3 +24,4 @@ knowledge_graph.html
 
 # Internal debugging log (not for the repo)
 DEBUGGING_NOTES.md
+test_anthropic.py

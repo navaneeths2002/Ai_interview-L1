@@ -35,9 +35,15 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-from app.realtime.interview_graph import build_interview_graph, make_initial_state, InterviewState
+from app.realtime.interview_graph import (
+    CAPTURE_FLAG,
+    InterviewState,
+    build_interview_graph,
+    make_initial_state,
+)
 from app.realtime import crash_recovery
 from app.realtime import audio_capture
+from app.realtime import stage_verifier
 from app.services import cost_tracker
 
 
@@ -69,6 +75,23 @@ if _DG_TTS_SPEED != 1.0:
         logger.info(f"[tts] Deepgram speech speed override active: speed={_DG_TTS_SPEED}")
     except Exception as _e:
         logger.warning(f"[tts] could not enable Deepgram speed override (non-fatal): {_e}")
+
+    # Flux TTS (/v2/speak) binds its OWN copy of _to_deepgram_url inside
+    # tts_v2.py, so the patch above never reaches it. Patch that binding too —
+    # clamped to Flux's supported speed range (0.85–1.15).
+    try:
+        from livekit.plugins.deepgram import tts_v2 as _dg_tts2_mod
+        _dg2_orig_to_url = _dg_tts2_mod._to_deepgram_url
+        _DG2_SPEED = max(0.85, min(1.15, _DG_TTS_SPEED))
+
+        def _dg2_to_url_with_speed(opts, base_url, *, websocket):
+            opts = {**opts, "speed": _DG2_SPEED}
+            return _dg2_orig_to_url(opts, base_url, websocket=websocket)
+
+        _dg_tts2_mod._to_deepgram_url = _dg2_to_url_with_speed
+        logger.info(f"[tts] Flux TTS speed override active: speed={_DG2_SPEED}")
+    except Exception as _e:
+        logger.warning(f"[tts] Flux TTS speed override unavailable (non-fatal): {_e}")
 
 
 # ── Candidate-join wait ────────────────────────────────────────────────────────
@@ -463,6 +486,15 @@ class HRInterviewAgent(Agent):
         # graph advance so the conversation_item_added handler labels AI turns
         # deterministically instead of racing a live read of mutable graph state.
         self._pending_ai_stage: str | None   = None
+        # ── Step 7 (skip-fix): async LLM stage verifier plumbing ──────────────
+        # _stage_texts: candidate utterances per stage — the verifier's input.
+        # _verify_fired: stages already audited (each stage verified at most once).
+        # _reopen_requests: verdicts land here from the background task; they are
+        #   APPLIED at the start of the next turn, before the graph runs — never
+        #   mid-flight, so a reopen can't race (and be lost to) ainvoke().
+        self._stage_texts: dict[str, list[str]] = {}
+        self._verify_fired: set[str]         = set()
+        self._reopen_requests: set[str]      = set()
         # FIX RC1: give the framework the full initial prompt (base + role context
         # + intro stage focus). NOTE: the old `instructions` PROPERTY override here
         # never worked — livekit-agents copies agent.instructions into the chat
@@ -539,6 +571,69 @@ class HRInterviewAgent(Agent):
             },
         )
 
+    # ── Step 7 (skip-fix): async LLM stage-verifier hooks ─────────────────────
+
+    def _request_reopen(self, stage: str) -> None:
+        """Called from the verifier's background task. Only RECORDS the request —
+        it is applied at the start of the next turn, before the graph runs, so a
+        reopen can never race (and be silently lost to) an in-flight ainvoke()."""
+        self._reopen_requests.add(stage)
+
+    def _apply_reopens(self) -> None:
+        """Apply pending verifier reopens BEFORE the graph runs this turn.
+        Reopening = remove the stage's 'captured' outcome + clear its capture
+        flag + un-mark it as asked. The graph's existing loop-back machinery
+        (_next_pending_stage + the wrap-up completeness gate) then makes Sarah
+        circle back and re-ask — no separate re-ask mechanism."""
+        if not self._reopen_requests:
+            return
+        state = self._graph_state
+        if state.get("stage") == "complete":
+            self._reopen_requests.clear()
+            return
+        for stage in list(self._reopen_requests):
+            self._reopen_requests.discard(stage)
+            if stage == state.get("stage"):
+                continue                     # currently ON it — nothing to reopen
+            outcomes = dict(state.get("stage_outcomes") or {})
+            if outcomes.get(stage) != "captured":
+                continue                     # not_disclosed / already reopened
+            outcomes.pop(stage, None)
+            state["stage_outcomes"] = outcomes
+            evidence = dict(state.get("stage_evidence") or {})
+            evidence.pop(stage, None)
+            state["stage_evidence"] = evidence
+            flag = CAPTURE_FLAG.get(stage)
+            if flag:
+                state[flag] = False
+            asked = dict(state.get("asked") or {})
+            asked.pop(stage, None)           # loop-back re-emit marks it asked again
+            state["asked"] = asked
+            logger.info(
+                f"[verifier] stage '{stage}' REOPENED — Sarah will circle back",
+                extra={"interview_id": self.interview_id},
+            )
+            crash_recovery.queue_save_stage(self.interview_id, state)
+
+    def _maybe_verify(self, pre_stage: str) -> None:
+        """After a graph advance: if `pre_stage` just closed as 'captured',
+        audit it in the background (fire-and-forget — zero turn latency).
+        'not_disclosed' closures are explicit refusals — nothing to audit."""
+        if pre_stage in ("wrap_up", "complete") or pre_stage in self._verify_fired:
+            return
+        if self._graph_state.get("stage") == pre_stage:
+            return                           # stage didn't close this turn
+        outcomes = self._graph_state.get("stage_outcomes") or {}
+        if outcomes.get(pre_stage) != "captured":
+            return
+        self._verify_fired.add(pre_stage)
+        stage_verifier.queue_verify(
+            self.interview_id,
+            pre_stage,
+            list(self._stage_texts.get(pre_stage) or []),
+            self._request_reopen,
+        )
+
     async def on_user_turn_completed(
         self,
         turn_ctx:    llm.ChatContext,
@@ -565,7 +660,13 @@ class HRInterviewAgent(Agent):
 
         # Save candidate turn — labeled with the PRE-advance stage: the answer
         # belongs to the question that was just asked (FIX RC4 convention).
-        self._queue_save("candidate", text, node=self._graph_state.get("stage"))
+        pre_stage = self._graph_state.get("stage")
+        self._queue_save("candidate", text, node=pre_stage)
+
+        # Step 7: collect this stage's replies for the async verifier, and apply
+        # any verifier reopens BEFORE the graph runs (race-free by design).
+        self._stage_texts.setdefault(pre_stage, []).append(text)
+        self._apply_reopens()
 
         # Advance LangGraph
         try:
@@ -576,6 +677,9 @@ class HRInterviewAgent(Agent):
             self._log_stage()
             # CRASH RECOVERY HOOK: persist stage so a crash can resume here
             crash_recovery.queue_save_stage(self.interview_id, self._graph_state)
+            # Step 7: if that turn closed the stage as "captured", audit it in
+            # the background — zero latency on this turn.
+            self._maybe_verify(pre_stage)
         except Exception as e:
             logger.error(
                 "LangGraph advance error",
@@ -630,7 +734,12 @@ class HRInterviewAgent(Agent):
         # FIX RC5: typed answers were never saved to the transcript at all —
         # this path had no _queue_save and the conversation_item_added handler
         # only records assistant items. Same convention as voice: pre-advance stage.
-        self._queue_save("candidate", text, node=self._graph_state.get("stage"))
+        pre_stage = self._graph_state.get("stage")
+        self._queue_save("candidate", text, node=pre_stage)
+
+        # Step 7: same verifier plumbing as the voice path.
+        self._stage_texts.setdefault(pre_stage, []).append(text)
+        self._apply_reopens()
 
         try:
             new_state = await self._graph.ainvoke(
@@ -640,6 +749,7 @@ class HRInterviewAgent(Agent):
             self._log_stage()
             # CRASH RECOVERY HOOK: persist stage so a crash can resume here
             crash_recovery.queue_save_stage(self.interview_id, self._graph_state)
+            self._maybe_verify(pre_stage)
         except Exception as e:
             logger.error(
                 "LangGraph advance error (typed)",
@@ -1393,7 +1503,67 @@ async def entrypoint(ctx: JobContext):
     # turn_detection (FIX A): semantic end-of-turn detector — when the
     # candidate pauses mid-thought, it keeps waiting (up to max_delay) instead
     # of letting Sarah talk over them. None → key omitted → acoustic default.
-    _turn_det = _build_turn_detector()
+
+    # ── Phase 13: STT/TTS provider switches (env-flagged, instantly revertible) ─
+    # TTS_PROVIDER=flux → Deepgram Flux TTS (/v2/speak) — conversation-native:
+    #   prosody/tone persists across turns, Interrupt reports text_spoken for
+    #   precise barge-in. Voice via TTS_FLUX_VOICE (Aura voices don't exist on
+    #   v2 — new catalog; flux-haley-en ≈ clear, professional, caring female).
+    # TTS_PROVIDER=aura → legacy Aura-2 (/v1/speak) with aura-2-vesta-en.
+    tts_provider = os.environ.get("TTS_PROVIDER", "aura").strip().lower()
+    if tts_provider == "flux":
+        tts = deepgram.TTSv2(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            model=os.environ.get("TTS_FLUX_VOICE", "flux-meena-en"),
+            sample_rate=24000,      # matches the room-audio fallback path
+        )
+    else:
+        tts = deepgram.TTS(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            model="aura-2-vesta-en",   # Sarah — warm female Aura-2 voice
+            sample_rate=24000,          # matches the room-audio fallback path
+        )
+
+    # STT_PROVIDER=flux → Deepgram Flux CSR (/v2/listen) — MODEL-BASED end-of-
+    #   turn detection (~260ms EOT, ~30% fewer false barge-ins). Replaces BOTH
+    #   the acoustic endpointing knobs AND the cloud semantic TurnDetector
+    #   (FIX A): Flux makes the semantic complete/incomplete judgement itself,
+    #   inside the STT. Silero VAD stays — it still powers interruption
+    #   detection while Sarah is speaking.
+    # STT_PROVIDER=nova → legacy nova-2-general + Silero endpointing + FIX A.
+    stt_provider = os.environ.get("STT_PROVIDER", "nova").strip().lower()
+    if stt_provider == "flux":
+        _flux_kwargs: dict = {}
+        # Optional EagerEndOfTurn: speculative LLM generation ~150–250ms before
+        # the confirmed turn end, at the cost of 50–70% more LLM calls (cheap
+        # on Haiku). Enabled only when FLUX_EAGER_EOT_THRESHOLD is set (0.3–0.9).
+        _eager = os.environ.get("FLUX_EAGER_EOT_THRESHOLD", "").strip()
+        if _eager:
+            _flux_kwargs["eager_eot_threshold"] = float(_eager)
+        stt = deepgram.STTv2(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            model="flux-general-en",
+            eot_threshold=float(os.environ.get("FLUX_EOT_THRESHOLD", "0.7")),
+            eot_timeout_ms=int(os.environ.get("FLUX_EOT_TIMEOUT_MS", "5000")),
+            **_flux_kwargs,
+        )
+    else:
+        stt = deepgram.STT(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            language="en",          # changed from en-IN — broader detection
+            model="nova-2-general",
+            endpointing_ms=200,     # reduced from 300ms — faster response
+            interim_results=True,
+            smart_format=True,
+            punctuate=True,
+            filler_words=False,
+        )
+
+    logger.info(
+        f"[pipeline] providers — stt={stt_provider}, tts={tts_provider}",
+        extra={"interview_id": interview_id},
+    )
+
     _turn_handling = TurnHandlingOptions(
         endpointing={
             "min_delay": 0.4,     # was min_endpointing_delay
@@ -1406,31 +1576,24 @@ async def entrypoint(ctx: JobContext):
             "min_duration": 0.5,  # noise floor: breaths/taps never interrupt
         },
     )
-    if _turn_det is not None:
-        _turn_handling["turn_detection"] = _turn_det
+    if stt_provider == "flux":
+        # Flux owns end-of-turn: the session must take turn boundaries from the
+        # STT's EndOfTurn events — not VAD silence, not the cloud TurnDetector.
+        _turn_handling["turn_detection"] = "stt"
+    else:
+        _turn_det = _build_turn_detector()
+        if _turn_det is not None:
+            _turn_handling["turn_detection"] = _turn_det
 
     session = AgentSession(
         turn_handling=_turn_handling,
         vad=_vad,
-        stt=deepgram.STT(
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-            language="en",          # changed from en-IN — broader detection
-            model="nova-2-general",
-            endpointing_ms=200,     # reduced from 300ms — faster response
-            interim_results=True,
-            smart_format=True,
-            punctuate=True,
-            filler_words=False,
-        ),
+        stt=stt,
         llm=anthropic.LLM(
             model="claude-haiku-4-5-20251001",
             api_key=os.environ["ANTHROPIC_API_KEY"],
         ),
-        tts=deepgram.TTS(
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-            model="aura-2-vesta-en",   # Sarah — warm female Aura-2 voice
-            sample_rate=24000,          # matches the room-audio fallback path
-        ),
+        tts=tts,
         # interruption/endpointing config lives in turn_handling above — the old
         # per-param equivalents (allow_interruptions, min_interruption_words,
         # min/max_endpointing_delay) are deprecated and must not be mixed in.

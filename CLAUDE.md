@@ -430,6 +430,40 @@ Clicking **Start Interview** now opens a readiness check before joining (Rejoin 
 
 ---
 
+## Deepgram Flux Pipeline (Phase 13)
+
+Both switches live in `.env` and are read in `app/realtime/agent.py` — rollback is instant (`TTS_PROVIDER=aura`, `STT_PROVIDER=nova`), no code change.
+
+**Flux TTS** (`TTS_PROVIDER=flux`, requires `livekit-agents>=1.6.9` for `deepgram.TTSv2`):
+- `/v2/speak` websocket — conversation-native: prosody/tone persists across turns; `Interrupt` reports `text_spoken` for precise barge-in truncation.
+- Voice via `TTS_FLUX_VOICE` (default `flux-haley-en`). **Aura voices don't exist on v2** — there is no `vesta` equivalent; Sarah's voice changes with this switch.
+- `sample_rate=24000` kept — matches the room-audio fallback path.
+- The `DEEPGRAM_TTS_SPEED` override is patched into BOTH `tts.py` (v1) and `tts_v2.py` (v2) — the two modules bind separate copies of `_to_deepgram_url`. The v2 patch clamps to Flux's 0.85–1.15 range.
+- Pricing: $45/1M chars (vs Aura-2 $30/1M) — **free until Sept 12 2026**; `pricing.py` bills at list rate either way.
+
+**Flux STT** (`STT_PROVIDER=flux`):
+- `/v2/listen` Flux CSR (`flux-general-en`) — model-based end-of-turn (~260ms, ~30% fewer false barge-ins). English-only.
+- Sets `turn_handling["turn_detection"] = "stt"` — Flux's `EndOfTurn` events own turn boundaries, replacing BOTH acoustic endpointing AND the cloud semantic TurnDetector (FIX A). Silero VAD stays for interruption detection only.
+- Tuning: `FLUX_EOT_THRESHOLD` (0.5–0.9, default 0.7), `FLUX_EOT_TIMEOUT_MS` (default 5000), optional `FLUX_EAGER_EOT_THRESHOLD` for speculative LLM generation (~150–250ms faster, 50–70% more LLM calls).
+- Pricing: $0.0065/min vs nova-2 $0.0058/min — `pricing.py` follows the provider flags.
+
+---
+
+## Stage-Skip Fix (Phase 14)
+
+Root cause: the graph treated EVERY candidate utterance as an answer attempt — a counter-question ("Is this role remote?") both burned an attempt AND collided with keyword detectors ("remote" → relocation "captured"), so stages were skipped with nothing collected.
+
+Seven-layer fix (`interview_graph.py` + `stage_verifier.py` + agent hooks):
+1. **Intent gate** — `classify_utterance()` → question / ack / answer. Questions and bare acks are DETOURS: no detector run, no attempt burned; Sarah answers briefly then re-asks the pending question. Clarification requests ("can you repeat that") are detours too.
+2. **Detour budget** — `MAX_DETOURS_PER_STAGE=4`; past it detours burn attempts and converge to the same explicit `not_disclosed` closure — a stage can never stall.
+3. **Hardened detectors** — bare "okay/sure/yes" removed from relocation (short affirmations count ONLY straight after the relocation question via the `detoured_since_ask` gate); notice/joining need an anchor word or number+time-unit, not bare "month/day".
+4. **Persistence** — detour counters + evidence survive reloads (`question_flow` payload keys: `detours`, `detoured`, `evidence`).
+5. **Evidence trail** — `stage_evidence[stage]` = the snippet that triggered capture; "captured but extraction null" is instantly debuggable.
+6. **Regression suite** — `tests/test_stage_skip_fix.py` (30 tests, no network/DB): `venv\Scripts\python -m pytest tests -q`.
+7. **Async LLM verifier** — `stage_verifier.queue_verify()` audits each "captured" stage in the background (Haiku, fire-and-forget, zero turn latency). Not really answered → reopen request → applied at next turn start (race-free) → the existing loop-back/wrap-up gate makes Sarah circle back: "one earlier detail is still missing…". Verified once per stage; any failure degrades to heuristic behaviour.
+
+---
+
 ## Environment Variables (.env)
 
 ```env
@@ -557,6 +591,8 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 10.7 | ✅ Done | Signed report token — HTML report URL requires ?token= (7-day expiry) |
 | 11 | ✅ Done | In-interview crash recovery — 60s grace timer, stage persistence, "Welcome back" resume |
 | 12 | ✅ Done | Voice reliability + candidate readiness — AvatarWatchdog (mid-stream self-heal) + pre-interview readiness modal (guidelines, mic/speaker/network/HTTPS check) |
+| 13 | ✅ Done | Deepgram Flux pipeline — Flux TTS (/v2/speak, conversation-native, `deepgram.TTSv2`) + Flux CSR STT (/v2/listen, model-based end-of-turn, `turn_detection="stt"`), env-flagged with Aura-2/nova-2 rollback |
+| 14 | ✅ Done | Stage-skip fix — intent gate (candidate questions/acks = detours, never answers), detour budget, hardened detectors, evidence trail, persisted counters, async LLM stage verifier (reopen + loop-back), 30-test regression suite |
 
 ---
 

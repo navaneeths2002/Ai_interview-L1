@@ -15,16 +15,26 @@ All rates are ESTIMATES (Jan 2026) — verify against current vendor pricing.
 
 from __future__ import annotations
 
+import os
+
 # ── Rates (USD) — edit as vendor pricing changes ────────────────────────────────
 CLAUDE_IN_PER_MTOK   = 1.0       # Haiku 4.5 input,  $ per 1M tokens
 CLAUDE_OUT_PER_MTOK  = 5.0       # Haiku 4.5 output, $ per 1M tokens
-DEEPGRAM_PER_MIN     = 0.0058    # nova-2 streaming, $ per audio-minute
 LIVEKIT_PER_PPMIN    = 0.0025    # LiveKit Cloud,    $ per participant-minute
 LIVEKIT_PARTICIPANTS = 3         # agent + candidate + simli-avatar
 SIMLI_PER_MIN        = 0.009     # avatar rendering, $ per minute
-# TTS marginal: Deepgram Aura-2 pay-as-you-go ≈ $30 / 1M characters.
-#   30 / 1_000_000 = 0.000030 $/char  (Aura-1 ≈ 0.0000225)
-TTS_USD_PER_CHAR     = 0.000030
+
+# ── Phase 13: provider-aware Deepgram rates ─────────────────────────────────────
+# Rates follow the STT_PROVIDER / TTS_PROVIDER switches in realtime/agent.py so
+# cost estimates stay honest whichever pipeline is live.
+#   STT streaming: nova-2 ≈ $0.0058/min · Flux CSR ≈ $0.0065/min
+#   TTS: Aura-2 ≈ $30/1M chars · Flux TTS ≈ $45/1M chars (list price — Flux TTS
+#   is FREE until Sept 12 2026; we bill at list rate here so estimates stay
+#   conservative during the promo window)
+_STT_PROVIDER = os.environ.get("STT_PROVIDER", "nova").strip().lower()
+_TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "aura").strip().lower()
+DEEPGRAM_PER_MIN = 0.0065 if _STT_PROVIDER == "flux" else 0.0058    # $ per audio-minute
+TTS_USD_PER_CHAR = 0.000045 if _TTS_PROVIDER == "flux" else 0.000030  # $ per character
 
 
 def _num(v) -> float:

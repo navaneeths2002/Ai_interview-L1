@@ -184,6 +184,11 @@ async def _save_stage(interview_id: str, graph_state: dict) -> None:
             # ("captured" | "not_disclosed").
             "asked":          dict(graph_state.get("asked") or {}),
             "outcomes":       dict(graph_state.get("stage_outcomes") or {}),
+            # Step 4 (skip-fix): detour accounting + capture evidence must
+            # survive a reload too, or a refresh mid-detour resets the budget.
+            "detours":        graph_state.get("detours_in_stage", 0),
+            "detoured":       bool(graph_state.get("detoured_since_ask")),
+            "evidence":       dict(graph_state.get("stage_evidence") or {}),
             "saved_at":       datetime.now(timezone.utc).isoformat(),
         }
     }
@@ -299,6 +304,13 @@ def apply_resume(graph_state: dict, resume: dict) -> dict:
     asked[graph_state["stage"]] = True
     graph_state["asked"]          = asked
     graph_state["stage_outcomes"] = outcomes
+
+    # Step 4 (skip-fix): restore detour accounting + capture evidence. After a
+    # reload the re-greet re-asks the stage question cleanly, so the
+    # detoured-since-ask gate resets — but the per-stage detour BUDGET survives.
+    graph_state["detours_in_stage"]   = int(resume.get("detours") or 0)
+    graph_state["detoured_since_ask"] = False
+    graph_state["stage_evidence"]     = dict(resume.get("evidence") or {})
 
     graph_state["stage_instruction"] = _make_instruction(graph_state["stage"], graph_state)
     return graph_state

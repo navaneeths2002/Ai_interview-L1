@@ -32,7 +32,8 @@ anthropic
 langgraph
 
 # LiveKit - Voice Pipeline (1.x)
-livekit-agents[anthropic,deepgram,elevenlabs,silero]
+# >=1.6.9 required for Deepgram Flux TTS (deepgram.TTSv2, /v2/speak) — Phase 13
+livekit-agents[anthropic,deepgram,elevenlabs,silero]>=1.6.9
 
 # Simli - Real-time avatar
 simli-ai
