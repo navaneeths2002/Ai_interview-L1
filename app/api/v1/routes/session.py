@@ -109,4 +109,10 @@ async def get_candidate_token(
         "livekit_url":    settings.livekit_url,    # reads from .env — no hardcoding
         "candidate_name": candidate_name,
         "interview_id":   interview_id,
+        # Phase 15 — screen proctoring: tells the browser whether to require
+        # screen sharing in the preflight modal and to send Layer-1 beacons.
+        "proctor": {
+            "enabled":        settings.proctor_enabled,
+            "require_screen": settings.proctor_require_screen,
+        },
     }

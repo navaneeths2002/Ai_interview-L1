@@ -44,6 +44,7 @@ from app.realtime.interview_graph import (
 from app.realtime import crash_recovery
 from app.realtime import audio_capture
 from app.realtime import stage_verifier
+from app.realtime import proctor
 from app.services import cost_tracker
 
 
@@ -1100,6 +1101,20 @@ async def entrypoint(ctx: JobContext):
         interview_id=interview_id,
     )
 
+    # ── SCREEN PROCTORING (Phase 15) — event-driven vision + sparse baseline ──
+    # All logic lives in app/realtime/proctor.py (crash_recovery pattern); the
+    # agent only forwards the screen track, browser beacons, and shutdown.
+    # Sarah's optional verbal warning goes through the live session.
+    async def _proctor_warning(instructions: str) -> None:
+        if _session_holder:
+            _session_holder[0].generate_reply(instructions=instructions)
+
+    proctor_session = proctor.ProctorSession(
+        interview_id=interview_id,
+        tenant_id=tenant_id,
+        on_warning=_proctor_warning,
+    )
+
     # ── FIX 4: Create hr_agent BEFORE on_shutdown ─────────────────────────────
     # Previously hr_agent was created AFTER on_shutdown was defined and
     # registered. If shutdown fired before hr_agent was assigned, the closure
@@ -1120,6 +1135,11 @@ async def entrypoint(ctx: JobContext):
     # ── Shutdown callback ──────────────────────────────────────────────────────
     async def on_shutdown() -> None:
         avatar_watchdog.stop()
+        # PROCTOR HOOK: cancel frame/baseline tasks + write the summary event.
+        try:
+            proctor_session.stop()
+        except Exception as e:
+            logger.warning(f"[proctor] stop failed (non-fatal): {e}")
 
         # ── GUARD: never finalize an interview the candidate did not attend ────
         # This job can end without anyone joining (dispatched at trigger time,
@@ -1271,6 +1291,25 @@ async def entrypoint(ctx: JobContext):
             )
             recorder.start(track)
 
+        # PROCTOR HOOK: candidate's screen-share video → frame buffer.
+        # kind 2 = video; source SOURCE_SCREENSHARE distinguishes it from any
+        # future camera track. (The candidate publishes no camera today, so the
+        # source check is belt-and-braces.)
+        if proctor.PROCTOR_ENABLED and str(getattr(participant, "identity", "")).startswith("candidate-"):
+            try:
+                from livekit import rtc as _rtc2
+                _is_video  = (_tk == _rtc2.TrackKind.KIND_VIDEO) or (_tk == 2)
+                _src       = getattr(publication, "source", None)
+                _is_screen = (_src == _rtc2.TrackSource.SOURCE_SCREENSHARE) or (_src == 3)
+                if _is_video and (_is_screen or _src is None):
+                    logger.info(
+                        "[proctor] candidate screen-share track detected",
+                        extra={"interview_id": interview_id},
+                    )
+                    proctor_session.attach_screen_track(track)
+            except Exception as e:
+                logger.warning(f"[proctor] screen attach failed (non-fatal): {e}")
+
     @ctx.room.on("track_published")
     def on_track_published(publication, participant) -> None:
         logger.info(
@@ -1290,6 +1329,25 @@ async def entrypoint(ctx: JobContext):
                 )
             except Exception as e:
                 logger.warning(f"[audio] set_subscribed failed: {e}")
+        # PROCTOR HOOK: make sure we also receive the candidate's screen share.
+        if (proctor.PROCTOR_ENABLED
+                and hasattr(participant, "identity")
+                and str(participant.identity).startswith("candidate-")
+                and publication.kind != "audio"):
+            try:
+                publication.set_subscribed(True)
+            except Exception as e:
+                logger.warning(f"[proctor] video set_subscribed failed: {e}")
+
+    @ctx.room.on("track_unsubscribed")
+    def on_track_unsubscribed(track, publication, participant) -> None:
+        # PROCTOR HOOK: screen share vanished server-side (candidate stopped it
+        # or the connection dropped) — stop the frame pump; the browser beacon
+        # ('share_stopped') carries the event itself.
+        if (proctor.PROCTOR_ENABLED
+                and str(getattr(participant, "identity", "")).startswith("candidate-")
+                and getattr(track, "kind", None) != 1):
+            proctor_session.screen_gone()
 
     # ── CRASH RECOVERY: 60s grace period instead of instant shutdown ──────────
     # A page reload looks like a disconnect. Previously the agent shut down
@@ -1697,6 +1755,18 @@ async def entrypoint(ctx: JobContext):
     @ctx.room.on("data_received")
     def on_data_received(data_packet) -> None:
         try:
+            # PROCTOR HOOK: Layer-1 beacons from the browser (tab switches,
+            # share stop/start, paste, multi-monitor). JSON payload.
+            if getattr(data_packet, "topic", None) == "proctor":
+                if proctor.PROCTOR_ENABLED:
+                    import json as _json
+                    try:
+                        beacon = _json.loads(data_packet.data.decode("utf-8"))
+                        if isinstance(beacon, dict):
+                            proctor_session.handle_beacon(beacon)
+                    except Exception as e:
+                        logger.warning(f"[proctor] bad beacon ignored: {e}")
+                return
             if getattr(data_packet, "topic", None) == "text_input":
                 text = data_packet.data.decode("utf-8").strip()
                 if text:

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     avatar_fallback_to_room_audio: bool = True  # if avatar can't (re)start, route voice via room audio
     avatar_watchdog_enabled: bool = True  # probe avatar health mid-interview; self-heal (restart → room-audio fallback)
 
+    # Screen Proctoring (Phase 15) — event-driven vision + sparse baseline
+    proctor_enabled: bool = True            # master switch (browser beacons + agent hooks)
+    proctor_require_screen: bool = True     # hard-block joining without entire-screen share
+    proctor_vision_enabled: bool = True     # Layer-2 Claude vision on triggers/baseline
+    proctor_baseline_interval_s: float = 150.0  # sparse safety net; 0 = pure event-driven
+    proctor_burst_cooldown_s: float = 30.0  # min gap between vision bursts per trigger family
+    proctor_max_vision_calls: int = 30      # hard cap per interview (cost guard)
+    proctor_verbal_warnings: bool = True    # Sarah politely warns from the 2nd violation
+
     # Email
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587

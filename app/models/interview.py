@@ -236,3 +236,24 @@ class AtsInterviewResult(BaseModel):
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=True)
 
     exported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InterviewProctorEvent(BaseModel):
+    """
+    Screen-proctoring audit trail (Phase 15) — one row per signal/violation.
+
+    event_type: share_started | share_stopped | display_surface | tab_hidden |
+                tab_visible | window_blur | window_focus | paste |
+                multi_monitor | vision_violation | share_never_started |
+                proctor_summary
+    severity:   info | medium | high
+    payload:    event-specific JSONB (vision_violation: trigger, apps, reason)
+    frame_s3_key: evidence screenshot for vision violations (nullable)
+    """
+    __tablename__ = "interview_proctor_events"
+
+    interview_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    event_type:   Mapped[str] = mapped_column(String(40), nullable=False)
+    severity:     Mapped[str] = mapped_column(String(10), nullable=False, default="info")
+    payload:      Mapped[dict] = mapped_column(JSONB, nullable=True)
+    frame_s3_key: Mapped[str] = mapped_column(String(500), nullable=True)

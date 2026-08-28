@@ -464,6 +464,24 @@ Seven-layer fix (`interview_graph.py` + `stage_verifier.py` + agent hooks):
 
 ---
 
+## Screen Proctoring (Phase 15)
+
+Event-driven vision + sparse baseline — Layer 1 (free signals) triggers Layer 2 (Claude vision) so honest candidates cost ~zero vision calls.
+
+**Flow:** preflight modal requires sharing the **entire screen** (`getDisplayMedia`, `displaySurface === "monitor"` enforced; window/tab picks rejected; Rejoin/Join-anyway paths also capture before connecting). The screen publishes as a LiveKit track (`source=ScreenShare`, `max_participants` unaffected). The agent keeps a **rolling 1-frame buffer** (`app/realtime/proctor.py` — crash_recovery pattern: own DB engine, thin agent hooks).
+
+**Layer 1 beacons** (browser → data channel topic `proctor`): `tab_hidden/tab_visible`, `window_blur/focus`, `share_started/stopped`, `display_surface`, `paste` (>80 chars), `multi_monitor` (`screen.isExtended`). All recorded to `interview_proctor_events`.
+
+**Layer 2 vision:** suspicious beacons trigger a burst (frame now + 2 follow-ups; blur+hidden share one cooldown family, `PROCTOR_BURST_COOLDOWN_S=30`, hard cap `PROCTOR_MAX_VISION_CALLS=30`); plus a sparse baseline every `PROCTOR_BASELINE_INTERVAL_S=150`s (0 = pure event-driven) to catch passive split-screen. Haiku vision knows the interview page itself is expected. Violations → JPEG evidence to S3 (`proctor/{interview_id}/...`), high-severity event, and from the 2nd violation Sarah gives a polite warning (max 2, `PROCTOR_VERBAL_WARNINGS`).
+
+**Report:** `compute_integrity()` (pure function) → 0–100 score with per-type deduction caps → "Screen Integrity" section with violation timeline + 7-day presigned evidence links. Old interviews without events render unchanged.
+
+**Config:** `PROCTOR_ENABLED`, `PROCTOR_REQUIRE_SCREEN` (hard-block join without share — cannot be bypassed by "join anyway"), `PROCTOR_VISION_ENABLED`, plus the knobs above. Token endpoint serves `{proctor:{enabled,require_screen}}` to the browser. Migration: `a1f6c9e2b3d4`. Tests: `tests/test_proctor.py`.
+
+**Limitations:** a second physical device (phone) is invisible to screen proctoring — webcam proctoring is the future answer; `getDisplayMedia` is desktop-only (proctored interviews require a laptop).
+
+---
+
 ## Environment Variables (.env)
 
 ```env
@@ -593,6 +611,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 12 | ✅ Done | Voice reliability + candidate readiness — AvatarWatchdog (mid-stream self-heal) + pre-interview readiness modal (guidelines, mic/speaker/network/HTTPS check) |
 | 13 | ✅ Done | Deepgram Flux pipeline — Flux TTS (/v2/speak, conversation-native, `deepgram.TTSv2`) + Flux CSR STT (/v2/listen, model-based end-of-turn, `turn_detection="stt"`), env-flagged with Aura-2/nova-2 rollback |
 | 14 | ✅ Done | Stage-skip fix — intent gate (candidate questions/acks = detours, never answers), detour budget, hardened detectors, evidence trail, persisted counters, async LLM stage verifier (reopen + loop-back), 30-test regression suite |
+| 15 | ✅ Done | Screen proctoring — event-driven vision + sparse baseline: entire-screen share required at preflight, Layer-1 beacons (tab/blur/paste/multi-monitor/share-stop) trigger Layer-2 Haiku vision on a rolling frame buffer, S3 evidence, escalation warnings, `interview_proctor_events` + Screen Integrity report section, 18-test suite |
 
 ---
 

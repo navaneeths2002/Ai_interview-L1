@@ -2811,6 +2811,21 @@
           </div>
           <span class="pf-badge pending" id="pf-badge-spk">PENDING</span>
         </div>
+
+        <div class="pf-check" id="pf-row-scr" style="display:none;">
+          <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+              <line x1="12" y1="17" x2="12" y2="21" />
+            </svg></div>
+          <div class="pf-check-bd">
+            <div class="pf-check-lbl">Screen sharing
+              <button id="pf-scr-share" class="pf-btn">Share entire screen</button>
+            </div>
+            <div class="pf-check-det" id="pf-det-scr">This interview is monitored for integrity. Share your <b>entire screen</b> (not a window or tab) to continue.</div>
+          </div>
+          <span class="pf-badge pending" id="pf-badge-scr">REQUIRED</span>
+        </div>
       </div>
 
       <div class="pf-foot">
@@ -3594,9 +3609,16 @@
     // muted/broken speakers, and no route to the server.
     const pf = {
       micStream: null, micCtx: null, micRaf: null, toneCtx: null,
-      results: { secure: null, net: null, mic: null, spk: null },
+      scrStream: null,   // proctoring screen share — captured in preflight, published on join
+      results: { secure: null, net: null, mic: null, spk: null, scr: true },
     };
     const pfScrim = document.getElementById('pf-scrim');
+
+    // ── Screen proctoring (Phase 15) config — served by the token endpoint ──────
+    function proctorCfg() {
+      const p = (cachedTokenData && cachedTokenData.proctor) || {};
+      return { enabled: !!p.enabled, requireScreen: !!p.require_screen };
+    }
 
     function pfBadge(row, state, text) {
       const b = document.getElementById('pf-badge-' + row);
@@ -3615,19 +3637,26 @@
     function pfUpdateJoin() {
       const r = pf.results;
       document.getElementById('pf-join').disabled =
-        !(r.secure && r.net && r.mic && r.spk);
-      // Offer the escape hatch only once something actually failed
+        !(r.secure && r.net && r.mic && r.spk && r.scr);
+      // Offer the escape hatch only once something actually failed — but a
+      // REQUIRED screen share can never be bypassed via "join anyway".
       const anyFail = [r.secure, r.net, r.mic, r.spk].some(v => v === false);
-      document.getElementById('pf-anyway').classList.toggle('show', anyFail);
+      const scrBlocks = proctorCfg().requireScreen && r.scr !== true;
+      document.getElementById('pf-anyway').classList.toggle('show', anyFail && !scrBlocks);
     }
 
     function openPreflight() {
       // Rejoin (in-progress) skips the checks — the 60s grace window is ticking
-      // and the devices already worked moments ago.
+      // and the devices already worked moments ago. (startInterview still
+      // captures the required screen share before connecting.)
       if (cachedTokenData && cachedTokenData.status === 'in_progress') { startInterview(); return; }
       const name = cachedTokenData && cachedTokenData.candidate_name;
       document.getElementById('pf-name').textContent = name ? ('Hi ' + name.split(/\s+/)[0]) : 'Hi there';
-      pf.results = { secure: null, net: null, mic: null, spk: null };
+      const needScr = proctorCfg().requireScreen;
+      pf.results = { secure: null, net: null, mic: null, spk: null,
+                     scr: needScr ? (pf.scrStream ? true : null) : true };
+      document.getElementById('pf-row-scr').style.display = needScr ? 'flex' : 'none';
+      if (needScr && !pf.scrStream) pfBadge('scr', 'pending', 'REQUIRED');
       document.getElementById('pf-mic-retry').style.display = 'none';
       document.getElementById('pf-spk-yes').style.display = 'none';
       document.getElementById('pf-mic-fill').style.width = '0%';
@@ -3639,6 +3668,46 @@
       runNetCheck();
       runMicCheck();
     }
+
+    // ── Screen-share capture (proctoring) ────────────────────────────────────────
+    // Must be called from a user gesture (getDisplayMedia needs activation).
+    // Enforces ENTIRE screen: window/tab shares are rejected with a retry.
+    async function captureScreen() {
+      try {
+        if (pf.scrStream) { pf.scrStream.getTracks().forEach(t => t.stop()); pf.scrStream = null; }
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { displaySurface: 'monitor', frameRate: 5 }, audio: false,
+        });
+        const track = stream.getVideoTracks()[0];
+        const surface = (track.getSettings && track.getSettings().displaySurface) || 'unknown';
+        if (surface !== 'monitor' && surface !== 'unknown') {
+          stream.getTracks().forEach(t => t.stop());
+          pfSet('scr', false, 'WRONG PICK',
+            'You shared a window/tab. Please click again and pick your ENTIRE screen.');
+          return false;
+        }
+        pf.scrStream = stream;
+        pfSet('scr', true, 'SHARING',
+          'Entire screen is being shared. Keep it shared for the whole interview.');
+        // If they stop sharing from the browser chrome BEFORE joining, re-require it.
+        track.addEventListener('ended', () => {
+          if (!room) {
+            pf.scrStream = null;
+            pf.results.scr = null;
+            pfBadge('scr', 'pending', 'REQUIRED');
+            pfDetail('scr', 'Screen sharing was stopped — please share your entire screen again.');
+            pfUpdateJoin();
+          }
+        });
+        return true;
+      } catch (e) {
+        pfSet('scr', false, 'BLOCKED',
+          'Screen sharing was declined. It is required for this interview — click "Share entire screen" and allow it.');
+        return false;
+      }
+    }
+
+    document.getElementById('pf-scr-share').addEventListener('click', captureScreen);
 
     function runSecureCheck() {
       // getUserMedia only exists on secure origins (https:// or localhost). This
@@ -3754,6 +3823,8 @@
 
     document.getElementById('pf-cancel').onclick = () => {
       pfCleanup();
+      // Cancel abandons the join — release the screen share too (Join keeps it).
+      if (pf.scrStream) { pf.scrStream.getTracks().forEach(t => t.stop()); pf.scrStream = null; }
       pfScrim.classList.remove('show');
     };
     document.getElementById('pf-join').onclick = () => {
@@ -3812,8 +3883,96 @@
       });
     }
 
+    // ── Proctoring: Layer-1 beacons + screen publishing ──────────────────────────
+    function sendProctor(type, extra) {
+      if (!room || !proctorCfg().enabled || endedByUser) return;
+      try {
+        const msg = JSON.stringify(Object.assign({ type: type, ts: Date.now() }, extra || {}));
+        room.localParticipant.publishData(
+          new TextEncoder().encode(msg), { reliable: true, topic: 'proctor' });
+      } catch (e) { console.warn('[proctor] beacon failed:', type, e); }
+    }
+
+    let proctorListenersOn = false;
+    function armProctorListeners() {
+      if (proctorListenersOn) return;
+      proctorListenersOn = true;
+      document.addEventListener('visibilitychange', () => {
+        sendProctor(document.hidden ? 'tab_hidden' : 'tab_visible');
+      });
+      window.addEventListener('blur', () => sendProctor('window_blur'));
+      window.addEventListener('focus', () => sendProctor('window_focus'));
+      // Large paste into the answer box — prepared-answer signal.
+      const ci = document.getElementById('cinput');
+      if (ci) ci.addEventListener('paste', (e) => {
+        try {
+          const txt = (e.clipboardData || window.clipboardData).getData('text') || '';
+          if (txt.length > 80) sendProctor('paste', { chars: txt.length });
+        } catch (err) { }
+      });
+    }
+
+    function showScreenBanner(show) {
+      let b = document.getElementById('scr-banner');
+      if (!b) {
+        b = document.createElement('div');
+        b.id = 'scr-banner';
+        b.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:70;' +
+          'background:#7F1D1D;color:#fff;border:1px solid #EF4444;border-radius:10px;' +
+          'padding:10px 16px;font-size:12.5px;font-weight:600;display:flex;gap:12px;align-items:center;' +
+          'box-shadow:0 8px 30px rgba(0,0,0,.4);';
+        b.innerHTML = '⚠ Screen sharing stopped — it is required for this interview. ' +
+          '<button id="scr-resume" style="border:none;border-radius:7px;padding:6px 12px;' +
+          'background:#fff;color:#7F1D1D;font-weight:700;font-size:12px;cursor:pointer;">Resume sharing</button>';
+        document.body.appendChild(b);
+        document.getElementById('scr-resume').addEventListener('click', async () => {
+          const ok = await captureScreen();
+          if (ok) await publishScreenShare();
+        });
+      }
+      b.style.display = show ? 'flex' : 'none';
+    }
+
+    async function publishScreenShare() {
+      if (!room || !pf.scrStream) return false;
+      try {
+        const track = pf.scrStream.getVideoTracks()[0];
+        if (!track) return false;
+        await room.localParticipant.publishTrack(track, {
+          source: LivekitClient.Track.Source.ScreenShare, name: 'proctor-screen',
+        });
+        const surface = (track.getSettings && track.getSettings().displaySurface) || 'unknown';
+        sendProctor('share_started', { surface: surface });
+        sendProctor('display_surface', { surface: surface });
+        showScreenBanner(false);
+        // Mid-interview stop (browser "Stop sharing" chrome) → beacon + banner.
+        track.addEventListener('ended', () => {
+          if (room && !endedByUser) {
+            sendProctor('share_stopped');
+            pf.scrStream = null;
+            if (proctorCfg().requireScreen) showScreenBanner(true);
+          }
+        });
+        console.log('[proctor] screen share published ✓ surface=' + surface);
+        return true;
+      } catch (e) {
+        console.error('[proctor] screen publish failed:', e);
+        return false;
+      }
+    }
+
     async function startInterview() {
       document.getElementById('startBtn').disabled = true;
+      // PROCTOR: a required screen share must exist BEFORE we spend the user
+      // gesture — covers the Rejoin path (which skips preflight) and Join-anyway.
+      if (proctorCfg().enabled && proctorCfg().requireScreen && !pf.scrStream) {
+        const ok = await captureScreen();
+        if (!ok) {
+          document.getElementById('startBtn').disabled = false;
+          addMsg('sys', '⚠ Screen sharing is required for this interview. Click Start and share your ENTIRE screen to continue.');
+          return;
+        }
+      }
       await runCountdown(3);   // animated 3-2-1 → GO before connecting
       document.getElementById('overlay').classList.add('show');
       setAvatarMode('thinking');
@@ -3976,6 +4135,15 @@
           addMsg('sys', '⚠ Microphone access was denied. Please allow microphone permission in your browser and refresh the page.');
         }
 
+        // PROCTOR: publish the screen share + arm Layer-1 beacons.
+        if (proctorCfg().enabled) {
+          armProctorListeners();
+          if (pf.scrStream) await publishScreenShare();
+          try {
+            if (window.screen && screen.isExtended === true) sendProctor('multi_monitor');
+          } catch (e) { }
+        }
+
       } catch (err) {
         console.error(err);
         document.getElementById('startBtn').disabled = false;
@@ -3999,6 +4167,9 @@
 
     async function endInterview() {
       endedByUser = true;
+      // PROCTOR: release the screen share + hide any resume banner.
+      if (pf.scrStream) { try { pf.scrStream.getTracks().forEach(t => t.stop()); } catch (e) { } pf.scrStream = null; }
+      showScreenBanner(false);
       if (room) { await room.disconnect(); room = null; }
       stopTimer();
       setConnLabel('Ended');

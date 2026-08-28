@@ -22,8 +22,9 @@ from app.core.security import create_report_token
 from app.db.session import AsyncSessionLocal
 from app.models.interview import (
     Interview, InterviewContext, InterviewTranscript,
-    InterviewExtractedData, InterviewScore,
+    InterviewExtractedData, InterviewScore, InterviewProctorEvent,
 )
+from app.realtime.proctor import compute_integrity
 from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.ats_score import AtsScore
@@ -342,6 +343,52 @@ def _render_html(d: dict) -> str:
       <p style="font-size:12.5px;color:#166534;font-weight:500;">&#10003; Single voice verified throughout the interview ({sc.get('total_speech_seconds','—')}s of speech analyzed).</p>
     </div>"""
 
+    # ── Screen Integrity (Phase 15 — proctoring events + integrity score) ─────
+    pr = d.get("proctor") or {}
+    proctor_section = ""
+    if pr:
+        _lvl = pr.get("level", "clean")
+        _psc = pr.get("score", 100)
+        _cnt = pr.get("counts", {}) or {}
+        _lvl_col = {"clean": "#166534", "minor": "#B45309", "flagged": "#B91C1C"}.get(_lvl, "#166534")
+        _sig_bits = []
+        for _k, _lbl in [("tab_hidden", "tab switches"), ("window_blur", "window blurs"),
+                         ("share_stopped", "share stops"), ("paste", "large pastes"),
+                         ("multi_monitor", "multi-monitor"), ("vision_violation", "confirmed violations")]:
+            if _cnt.get(_k):
+                _sig_bits.append(f"{_cnt[_k]} {_lbl}")
+        _sig_line = ", ".join(_sig_bits) if _sig_bits else "no suspicious signals"
+        _vio_html = ""
+        for _v in (pr.get("violations") or [])[:5]:
+            _apps = _esc(", ".join(_v.get("apps") or []) or "—")
+            _link = (f' &middot; <a href="{_v["evidence_url"]}" target="_blank" '
+                     f'style="color:#2563EB;">evidence screenshot</a>') if _v.get("evidence_url") else ""
+            _vio_html += (
+                f'<div style="font-size:12px;color:#7F1D1D;padding:6px 0;border-bottom:1px solid #FECACA;">'
+                f'<b>{_esc(_v.get("at",""))}</b> &mdash; {_esc(_v.get("reason",""))} '
+                f'<span style="color:#B91C1C;">({_apps})</span>{_link}</div>'
+            )
+        if _lvl == "clean":
+            proctor_section = f"""
+    <div class="section">
+      <div class="section-title">Screen Integrity</div>
+      <p style="font-size:12.5px;color:#166534;font-weight:500;">&#10003; Screen monitored throughout — integrity score <b>{_psc}/100</b> ({_esc(_sig_line)}).</p>
+    </div>"""
+        else:
+            proctor_section = f"""
+    <div class="section">
+      <div class="section-title">Screen Integrity</div>
+      <div style="display:flex;gap:10px;align-items:flex-start;background:#FFFBEB;border:1px solid #FDE68A;border-left:3px solid {_lvl_col};border-radius:9px;padding:12px 14px;">
+        <span style="font-size:16px;">&#128274;</span>
+        <div style="font-size:12.5px;line-height:1.6;flex:1;">
+          <b style="color:{_lvl_col};">Integrity score {_psc}/100 &mdash; {_esc(_lvl.upper())}</b>
+          <div style="color:#475569;margin-top:2px;">Signals: {_esc(_sig_line)}.</div>
+          {_vio_html}
+          <div class="muted" style="margin-top:6px;font-size:11px;">Automated screen monitoring (event-triggered vision checks) &mdash; advisory, review evidence before a decision.</div>
+        </div>
+      </div>
+    </div>"""
+
     gen_at  = d.get("generated_at", "")
     dur_sec = d.get("duration_seconds")
     dur_str = f"{dur_sec // 60}m {dur_sec % 60}s" if dur_sec else "—"
@@ -574,6 +621,7 @@ def _render_html(d: dict) -> str:
 {weights_section}
 {voice_section}
 {speaker_section}
+{proctor_section}
 
     <!-- Executive summary -->
     <div class="section">
@@ -709,6 +757,48 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
     # Falls back to empty dict gracefully when the column is null (pre-migration rows).
     ext_data: dict = (ext_row.extracted or {}) if ext_row else {}
 
+    # ── Phase 15: screen-proctoring events → integrity summary ────────────────
+    proctor_summary = None
+    try:
+        ev_rows = (await db.execute(
+            select(InterviewProctorEvent)
+            .where(InterviewProctorEvent.interview_id == interview_id)
+            .order_by(InterviewProctorEvent.created_at)
+        )).scalars().all()
+        if ev_rows:
+            events = [{
+                "event_type":   r.event_type,
+                "severity":     r.severity,
+                "payload":      r.payload or {},
+                "frame_s3_key": r.frame_s3_key,
+                "created_at":   r.created_at.strftime("%H:%M:%S UTC") if r.created_at else "",
+            } for r in ev_rows if r.event_type != "proctor_summary"]
+            proctor_summary = compute_integrity(events)
+            proctor_summary["events_total"] = len(events)
+            # Presigned evidence URLs (7 days — matches the report token lifetime)
+            if settings.s3_bucket_name:
+                try:
+                    import boto3
+                    s3 = boto3.client(
+                        "s3",
+                        aws_access_key_id=settings.aws_access_key_id or None,
+                        aws_secret_access_key=settings.aws_secret_access_key or None,
+                        region_name=settings.aws_region or None,
+                    )
+                    for v in proctor_summary["violations"]:
+                        if v.get("frame_s3_key"):
+                            v["evidence_url"] = s3.generate_presigned_url(
+                                "get_object",
+                                Params={"Bucket": settings.s3_bucket_name,
+                                        "Key": v["frame_s3_key"]},
+                                ExpiresIn=7 * 24 * 3600,
+                            )
+                except Exception as e:
+                    logger.warning(f"[report] evidence presign failed (non-fatal): {e}")
+    except Exception as e:
+        # Table may not exist yet (migration not applied) — report continues.
+        logger.warning(f"[report] proctor events unavailable (non-fatal): {e}")
+
     now = datetime.now(timezone.utc)
 
     report_data = {
@@ -738,6 +828,8 @@ async def _assemble(db: AsyncSession, interview_id: str) -> dict | None:
         "voice_analysis": raw.get("voice_analysis"),
         # Voice Guard v1 — post-interview distinct-voice check (None for old rows)
         "speaker_check":  raw.get("speaker_check"),
+        # Phase 15 — screen-proctoring integrity summary (None when no events)
+        "proctor":        proctor_summary,
         "summary":        summary,
         "score_rationale": raw.get("score_rationale") or {},
         "strengths":      strengths,
