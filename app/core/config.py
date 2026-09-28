@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     proctor_max_vision_calls: int = 30      # hard cap per interview (cost guard)
     proctor_verbal_warnings: bool = True    # Sarah politely warns from the 2nd violation
 
+    # Camera Proctoring (Phase 16, Layer 1) — in-browser face presence/count
+    proctor_camera_enabled: bool = True     # camera face monitoring (beacons + events)
+    proctor_require_camera: bool = True     # hard-block joining without a working camera
+    proctor_presence_prompt_delay_s: float = 10.0  # face lost this long → Sarah asks "are you there?"
+    proctor_presence_prompts_max: int = 2   # max "are you there?" prompts per interview
+
     # Email
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587

@@ -354,7 +354,9 @@ def _render_html(d: dict) -> str:
         _sig_bits = []
         for _k, _lbl in [("tab_hidden", "tab switches"), ("window_blur", "window blurs"),
                          ("share_stopped", "share stops"), ("paste", "large pastes"),
-                         ("multi_monitor", "multi-monitor"), ("vision_violation", "confirmed violations")]:
+                         ("multi_monitor", "multi-monitor"), ("vision_violation", "confirmed violations"),
+                         ("face_lost", "camera absences"), ("multiple_faces", "second-person detections"),
+                         ("camera_stopped", "camera stops"), ("presence_prompt", "presence checks")]:
             if _cnt.get(_k):
                 _sig_bits.append(f"{_cnt[_k]} {_lbl}")
         _sig_line = ", ".join(_sig_bits) if _sig_bits else "no suspicious signals"
@@ -371,13 +373,13 @@ def _render_html(d: dict) -> str:
         if _lvl == "clean":
             proctor_section = f"""
     <div class="section">
-      <div class="section-title">Screen Integrity</div>
+      <div class="section-title">Screen &amp; Camera Integrity</div>
       <p style="font-size:12.5px;color:#166534;font-weight:500;">&#10003; Screen monitored throughout — integrity score <b>{_psc}/100</b> ({_esc(_sig_line)}).</p>
     </div>"""
         else:
             proctor_section = f"""
     <div class="section">
-      <div class="section-title">Screen Integrity</div>
+      <div class="section-title">Screen &amp; Camera Integrity</div>
       <div style="display:flex;gap:10px;align-items:flex-start;background:#FFFBEB;border:1px solid #FDE68A;border-left:3px solid {_lvl_col};border-radius:9px;padding:12px 14px;">
         <span style="font-size:16px;">&#128274;</span>
         <div style="font-size:12.5px;line-height:1.6;flex:1;">

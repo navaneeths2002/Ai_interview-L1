@@ -74,6 +74,25 @@ BURST_FOLLOWUP_GAP_S     = 8.0
 WARN_AT_VIOLATIONS       = 2       # Sarah warns on the 2nd confirmed violation
 MAX_WARNINGS             = 2
 
+# Phase 16 - Camera proctoring (Layer 1: in-browser face detection; no LLM
+# here - Layer-2 camera-frame verification is deliberately NOT built, that
+# slot is reserved for the in-house face-detection service).
+PROCTOR_CAMERA_ENABLED   = _env_bool("PROCTOR_CAMERA_ENABLED")
+PRESENCE_PROMPT_DELAY_S  = _env_float("PROCTOR_PRESENCE_PROMPT_DELAY_S", 10.0)
+PRESENCE_PROMPTS_MAX     = int(_env_float("PROCTOR_PRESENCE_PROMPTS_MAX", 2))
+
+_PRESENCE_PROMPT_INSTR = (
+    "The candidate seems to have left the camera frame. Gently check on them - "
+    "say something like 'Are you still with me? I cannot see you on camera.' "
+    "Keep it warm and brief, then wait for their response."
+)
+_MULTI_FACE_WARN_INSTR = (
+    "A second person appears to be visible on the candidate's camera. Without "
+    "being accusatory, politely remind the candidate that they must be alone "
+    "during this interview, as the session is monitored. Then continue with "
+    "the current question."
+)
+
 VISION_MODEL             = "claude-haiku-4-5-20251001"
 VISION_TIMEOUT_S         = 20.0
 VISION_MAX_TOKENS        = 200
@@ -91,6 +110,15 @@ BEACON_POLICY: dict[str, tuple[str, bool]] = {
     "window_focus":    ("info",   True),
     "paste":           ("medium", True),
     "multi_monitor":   ("medium", False),  # other display isn't shared — flag only
+    # Phase 16 - camera face monitoring (browser-detected, debounced there).
+    # triggers_vision stays False for ALL camera beacons: Layer 2 for camera
+    # frames is reserved for the in-house face-detection service.
+    "camera_started":       ("info",   False),
+    "camera_stopped":       ("high",   False),
+    "face_lost":            ("medium", False),
+    "face_returned":        ("info",   False),
+    "multiple_faces":       ("high",   False),
+    "single_face_restored": ("info",   False),
 }
 
 _VISION_SYSTEM = (
@@ -258,6 +286,11 @@ _SCORE_RULES: dict[str, tuple[int, int]] = {
     "paste":              (5,  15),
     "multi_monitor":      (5,  5),
     "share_never_started": (30, 30),
+    # Phase 16 - camera face monitoring
+    "multiple_faces":       (15, 45),
+    "face_lost":            (4,  20),
+    "camera_stopped":       (10, 30),
+    "camera_never_started": (30, 30),
 }
 
 
@@ -284,6 +317,16 @@ def compute_integrity(events: list[dict]) -> dict:
                 "trigger": p.get("trigger", ""),
                 "apps":    p.get("apps", []),
                 "reason":  p.get("reason", ""),
+                "frame_s3_key": ev.get("frame_s3_key"),
+            })
+        elif et == "multiple_faces":
+            p = ev.get("payload") or {}
+            _cnt_note = f" ({p.get('count')} faces)" if p.get("count") else ""
+            violations.append({
+                "at":      str(ev.get("created_at") or ""),
+                "trigger": "camera",
+                "apps":    [],
+                "reason":  "Second person detected on camera" + _cnt_note,
                 "frame_s3_key": ev.get("frame_s3_key"),
             })
     score = max(0, 100 - sum(deductions.values()))
@@ -337,6 +380,11 @@ class ProctorSession:
         self._last_burst_at: dict[str, float] = {}   # trigger type → loop time
         self._share_seen     = False
         self._stopped        = False
+        # Phase 16 - camera face monitoring state
+        self._camera_seen        = False
+        self._presence_task: asyncio.Task | None = None
+        self._presence_prompts   = 0
+        self._face_lost_episodes = 0
 
     # ── plumbing ────────────────────────────────────────────────────────────────
 
@@ -433,8 +481,61 @@ class ProctorSession:
         logger.info(f"[proctor] beacon: {btype} ({severity})",
                     extra={"interview_id": self.interview_id})
 
+        # Phase 16 - camera reactions (Layer 1, no vision):
+        if btype == "camera_started":
+            self._camera_seen = True
+        elif btype == "face_lost":
+            self._face_lost_episodes += 1
+            self._schedule_presence_prompt()
+        elif btype in ("face_returned", "single_face_restored"):
+            self._cancel_presence_prompt()
+        elif btype == "multiple_faces":
+            # Browser-detected second person joins the SAME escalation ladder
+            # as vision violations (Sarah warns from the 2nd, max twice).
+            self._violations += 1
+            if (PROCTOR_VERBAL_WARNINGS and self._on_warning
+                    and self._violations >= WARN_AT_VIOLATIONS
+                    and self._warnings_given < MAX_WARNINGS):
+                self._warnings_given += 1
+                self._spawn(self._say(_MULTI_FACE_WARN_INSTR), name="proctor-multiface-warn")
+
         if triggers_vision:
             self._maybe_burst(trigger=btype)
+
+    # ── Phase 16: presence prompt ("are you there?") ────────────────────────────
+
+    def _schedule_presence_prompt(self) -> None:
+        """Face lost -> if still lost after PRESENCE_PROMPT_DELAY_S, Sarah asks
+        whether the candidate is there (bounded per interview). A face_returned
+        beacon cancels the pending prompt."""
+        if (self._stopped or not self._on_warning
+                or not PROCTOR_VERBAL_WARNINGS
+                or self._presence_prompts >= PRESENCE_PROMPTS_MAX):
+            return
+        self._cancel_presence_prompt()
+
+        async def _wait_and_ask() -> None:
+            await asyncio.sleep(PRESENCE_PROMPT_DELAY_S)
+            if self._stopped or self._presence_prompts >= PRESENCE_PROMPTS_MAX:
+                return
+            self._presence_prompts += 1
+            self.record_event("presence_prompt", "info",
+                              {"prompt_n": self._presence_prompts})
+            await self._say(_PRESENCE_PROMPT_INSTR)
+
+        self._presence_task = asyncio.create_task(_wait_and_ask(), name="proctor-presence")
+
+    def _cancel_presence_prompt(self) -> None:
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+        self._presence_task = None
+
+    async def _say(self, instructions: str) -> None:
+        """Route any spoken proctor reaction through the agent's session."""
+        try:
+            await self._on_warning(instructions)
+        except Exception as e:
+            logger.warning(f"[proctor] spoken reaction failed (non-fatal): {e}")
 
     # ── Layer 2: event-triggered vision ─────────────────────────────────────────
 
@@ -509,15 +610,12 @@ class ProctorSession:
             self._spawn(self._warn(), name="proctor-warning")
 
     async def _warn(self) -> None:
-        try:
-            await self._on_warning(
-                "Without breaking the interview flow, give the candidate one brief, "
-                "polite reminder to please stay on the interview screen and close "
-                "other windows, as the session is monitored. Then continue with the "
-                "current question."
-            )
-        except Exception as e:
-            logger.warning(f"[proctor] verbal warning failed (non-fatal): {e}")
+        await self._say(
+            "Without breaking the interview flow, give the candidate one brief, "
+            "polite reminder to please stay on the interview screen and close "
+            "other windows, as the session is monitored. Then continue with the "
+            "current question."
+        )
 
     # ── shutdown ────────────────────────────────────────────────────────────────
 
@@ -526,16 +624,22 @@ class ProctorSession:
         if self._stopped:
             return
         self._stopped = True
+        self._cancel_presence_prompt()
         for t in (self._pump_task, self._baseline_task):
             if t and not t.done():
                 t.cancel()
         if self.interview_id and self.tenant_id:
             if not self._share_seen and PROCTOR_ENABLED:
                 self.record_event("share_never_started", "high", {})
+            if not self._camera_seen and PROCTOR_ENABLED and PROCTOR_CAMERA_ENABLED:
+                self.record_event("camera_never_started", "high", {})
             self.record_event(
                 "proctor_summary", "info",
                 {"vision_calls": self._vision_calls,
                  "violations": self._violations,
                  "warnings_given": self._warnings_given,
-                 "share_seen": self._share_seen},
+                 "share_seen": self._share_seen,
+                 "camera_seen": self._camera_seen,
+                 "face_lost_episodes": self._face_lost_episodes,
+                 "presence_prompts": self._presence_prompts},
             )

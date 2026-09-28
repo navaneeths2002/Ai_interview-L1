@@ -2826,6 +2826,22 @@
           </div>
           <span class="pf-badge pending" id="pf-badge-scr">REQUIRED</span>
         </div>
+
+        <div class="pf-check" id="pf-row-cam" style="display:none;">
+          <div class="pf-check-ic"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M23 7l-7 5 7 5V7z" />
+              <rect x="1" y="5" width="15" height="14" rx="2" />
+            </svg></div>
+          <div class="pf-check-bd">
+            <div class="pf-check-lbl">Camera
+              <button id="pf-cam-start" class="pf-btn">Enable camera</button>
+            </div>
+            <div class="pf-check-det" id="pf-det-cam">Your camera stays on during the interview — face presence is monitored for integrity.</div>
+            <video id="pf-cam-prev" autoplay playsinline muted
+                   style="display:none;width:132px;height:88px;object-fit:cover;border-radius:8px;margin-top:7px;background:#000;border:1px solid var(--bdr);"></video>
+          </div>
+          <span class="pf-badge pending" id="pf-badge-cam">REQUIRED</span>
+        </div>
       </div>
 
       <div class="pf-foot">
@@ -3610,14 +3626,16 @@
     const pf = {
       micStream: null, micCtx: null, micRaf: null, toneCtx: null,
       scrStream: null,   // proctoring screen share — captured in preflight, published on join
-      results: { secure: null, net: null, mic: null, spk: null, scr: true },
+      camStream: null,   // proctoring camera — captured in preflight, published on join
+      results: { secure: null, net: null, mic: null, spk: null, scr: true, cam: true },
     };
     const pfScrim = document.getElementById('pf-scrim');
 
     // ── Screen proctoring (Phase 15) config — served by the token endpoint ──────
     function proctorCfg() {
       const p = (cachedTokenData && cachedTokenData.proctor) || {};
-      return { enabled: !!p.enabled, requireScreen: !!p.require_screen };
+      return { enabled: !!p.enabled, requireScreen: !!p.require_screen,
+               camera: !!p.camera, requireCamera: !!p.require_camera };
     }
 
     function pfBadge(row, state, text) {
@@ -3637,12 +3655,13 @@
     function pfUpdateJoin() {
       const r = pf.results;
       document.getElementById('pf-join').disabled =
-        !(r.secure && r.net && r.mic && r.spk && r.scr);
+        !(r.secure && r.net && r.mic && r.spk && r.scr && r.cam);
       // Offer the escape hatch only once something actually failed — but a
       // REQUIRED screen share can never be bypassed via "join anyway".
       const anyFail = [r.secure, r.net, r.mic, r.spk].some(v => v === false);
       const scrBlocks = proctorCfg().requireScreen && r.scr !== true;
-      document.getElementById('pf-anyway').classList.toggle('show', anyFail && !scrBlocks);
+      const camBlocks = proctorCfg().requireCamera && r.cam !== true;
+      document.getElementById('pf-anyway').classList.toggle('show', anyFail && !scrBlocks && !camBlocks);
     }
 
     function openPreflight() {
@@ -3653,10 +3672,14 @@
       const name = cachedTokenData && cachedTokenData.candidate_name;
       document.getElementById('pf-name').textContent = name ? ('Hi ' + name.split(/\s+/)[0]) : 'Hi there';
       const needScr = proctorCfg().requireScreen;
+      const needCam = proctorCfg().camera && proctorCfg().requireCamera;
       pf.results = { secure: null, net: null, mic: null, spk: null,
-                     scr: needScr ? (pf.scrStream ? true : null) : true };
+                     scr: needScr ? (pf.scrStream ? true : null) : true,
+                     cam: needCam ? (pf.camStream ? true : null) : true };
       document.getElementById('pf-row-scr').style.display = needScr ? 'flex' : 'none';
       if (needScr && !pf.scrStream) pfBadge('scr', 'pending', 'REQUIRED');
+      document.getElementById('pf-row-cam').style.display = (proctorCfg().camera) ? 'flex' : 'none';
+      if (needCam && !pf.camStream) pfBadge('cam', 'pending', 'REQUIRED');
       document.getElementById('pf-mic-retry').style.display = 'none';
       document.getElementById('pf-spk-yes').style.display = 'none';
       document.getElementById('pf-mic-fill').style.width = '0%';
@@ -3823,8 +3846,9 @@
 
     document.getElementById('pf-cancel').onclick = () => {
       pfCleanup();
-      // Cancel abandons the join — release the screen share too (Join keeps it).
+      // Cancel abandons the join — release the screen share + camera too (Join keeps them).
       if (pf.scrStream) { pf.scrStream.getTracks().forEach(t => t.stop()); pf.scrStream = null; }
+      if (pf.camStream) { pf.camStream.getTracks().forEach(t => t.stop()); pf.camStream = null; }
       pfScrim.classList.remove('show');
     };
     document.getElementById('pf-join').onclick = () => {
@@ -3881,6 +3905,159 @@
           }
         }, 1000);
       });
+    }
+
+    // ── Camera proctoring (Phase 16, Layer 1) ────────────────────────────────────
+    // A lightweight face detector (MediaPipe, WASM) runs LOCALLY at ~1 fps and
+    // only sends debounced state-change beacons. No video analysis leaves the
+    // browser — Layer 2 (server-side face verification) is a future service.
+    const faceMon = {
+      detector: null, video: null, timer: null, state: 'unknown',
+      pend: null, pendCount: 0, lostAt: 0, manyAt: 0, degraded: false,
+    };
+
+    async function loadFaceDetector() {
+      if (faceMon.detector || faceMon.degraded) return faceMon.detector;
+      try {
+        const v = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+        const files = await v.FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+        faceMon.detector = await v.FaceDetector.createFromOptions(files, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+          },
+          runningMode: 'VIDEO', minDetectionConfidence: 0.5,
+        });
+        console.log('[face] detector loaded ✓');
+      } catch (e) {
+        console.warn('[face] detector unavailable — degraded mode (presence beacons off):', e);
+        faceMon.degraded = true;
+      }
+      return faceMon.detector;
+    }
+
+    function faceCount() {
+      if (!faceMon.detector || !faceMon.video || faceMon.video.readyState < 2) return null;
+      try {
+        const res = faceMon.detector.detectForVideo(faceMon.video, performance.now());
+        return (res.detections || []).length;
+      } catch (e) { return null; }
+    }
+
+    async function captureCamera() {
+      try {
+        if (pf.camStream) { pf.camStream.getTracks().forEach(t => t.stop()); pf.camStream = null; }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } },
+          audio: false,
+        });
+        pf.camStream = stream;
+        const prev = document.getElementById('pf-cam-prev');
+        if (prev) { prev.srcObject = stream; prev.style.display = 'block'; }
+        pfBadge('cam', 'checking', 'CHECKING FACE…');
+        pfDetail('cam', 'Camera on. Looking for your face — sit centred and well lit.');
+        // Face check: pass when exactly ONE face is seen. Degraded (model
+        // unavailable) → pass on permission alone with a note.
+        const det = await loadFaceDetector();
+        if (!det) {
+          pfSet('cam', true, 'CAMERA ON', 'Camera working. (Face check unavailable on this network — monitoring still applies.)');
+          return true;
+        }
+        faceMon.video = prev;
+        let tries = 0;
+        await new Promise((resolve) => {
+          const iv = setInterval(() => {
+            tries++;
+            const n = faceCount();
+            if (n === 1) {
+              clearInterval(iv);
+              pfSet('cam', true, 'FACE DETECTED', 'Face detected — you are good to go. Stay in frame during the interview.');
+              resolve();
+            } else if (n !== null && n >= 2) {
+              pfDetail('cam', 'More than one face detected — only YOU should be visible. Ask others to step away.');
+            } else if (tries > 40) {           // ~20s
+              clearInterval(iv);
+              pfSet('cam', false, 'NO FACE', 'Could not detect your face. Improve lighting, face the camera, then press "Enable camera" again.');
+              resolve();
+            }
+          }, 500);
+        });
+        return pf.results.cam === true;
+      } catch (e) {
+        pfSet('cam', false, 'BLOCKED',
+          'Camera access was declined. It is required for this interview — click "Enable camera" and allow it.');
+        return false;
+      }
+    }
+
+    document.getElementById('pf-cam-start').addEventListener('click', captureCamera);
+
+    function startFaceMonitor() {
+      // Continuous 1 fps face-count monitor with debounce → beacons.
+      if (!faceMon.detector || !pf.camStream || faceMon.timer) return;
+      if (!faceMon.video) {
+        const v = document.createElement('video');
+        v.autoplay = true; v.playsInline = true; v.muted = true;
+        v.style.display = 'none';
+        document.body.appendChild(v);
+        faceMon.video = v;
+      }
+      if (faceMon.video.srcObject !== pf.camStream) faceMon.video.srcObject = pf.camStream;
+      faceMon.state = 'one'; faceMon.pend = null; faceMon.pendCount = 0;
+
+      const NEED = { none: 3, many: 2, one: 2 };   // consecutive 1s samples to commit
+      faceMon.timer = setInterval(() => {
+        const n = faceCount();
+        if (n === null) return;                     // model hiccup — skip sample
+        const cand = (n === 0) ? 'none' : (n === 1) ? 'one' : 'many';
+        if (cand === faceMon.state) { faceMon.pend = null; faceMon.pendCount = 0; return; }
+        if (cand !== faceMon.pend) { faceMon.pend = cand; faceMon.pendCount = 1; return; }
+        faceMon.pendCount++;
+        if (faceMon.pendCount < NEED[cand]) return;
+        // Commit the transition
+        const prev = faceMon.state;
+        faceMon.state = cand; faceMon.pend = null; faceMon.pendCount = 0;
+        const now = Date.now();
+        if (cand === 'none') {
+          faceMon.lostAt = now;
+          sendProctor('face_lost', { from: prev });
+        } else if (cand === 'many') {
+          faceMon.manyAt = now;
+          sendProctor('multiple_faces', { count: n });
+        } else if (cand === 'one') {
+          if (prev === 'none') sendProctor('face_returned', { away_s: Math.round((now - faceMon.lostAt) / 1000) });
+          else sendProctor('single_face_restored', { many_s: Math.round((now - faceMon.manyAt) / 1000) });
+        }
+      }, 1000);
+      console.log('[face] monitor started (1 fps, debounced)');
+    }
+
+    function stopFaceMonitor() {
+      if (faceMon.timer) { clearInterval(faceMon.timer); faceMon.timer = null; }
+    }
+
+    async function publishCamera() {
+      if (!room || !pf.camStream) return false;
+      try {
+        const track = pf.camStream.getVideoTracks()[0];
+        if (!track) return false;
+        await room.localParticipant.publishTrack(track, {
+          source: LivekitClient.Track.Source.Camera, name: 'proctor-camera',
+        });
+        sendProctor('camera_started');
+        track.addEventListener('ended', () => {
+          if (room && !endedByUser) {
+            sendProctor('camera_stopped');
+            stopFaceMonitor();
+            pf.camStream = null;
+          }
+        });
+        console.log('[proctor] camera published ✓');
+        return true;
+      } catch (e) {
+        console.error('[proctor] camera publish failed:', e);
+        return false;
+      }
     }
 
     // ── Proctoring: Layer-1 beacons + screen publishing ──────────────────────────
@@ -3970,6 +4147,15 @@
         if (!ok) {
           document.getElementById('startBtn').disabled = false;
           addMsg('sys', '⚠ Screen sharing is required for this interview. Click Start and share your ENTIRE screen to continue.');
+          return;
+        }
+      }
+      // PROCTOR (Phase 16): required camera must exist too (Rejoin path).
+      if (proctorCfg().enabled && proctorCfg().camera && proctorCfg().requireCamera && !pf.camStream) {
+        const okc = await captureCamera();
+        if (!okc) {
+          document.getElementById('startBtn').disabled = false;
+          addMsg('sys', '⚠ A working camera is required for this interview. Click Start and allow camera access to continue.');
           return;
         }
       }
@@ -4139,6 +4325,11 @@
         if (proctorCfg().enabled) {
           armProctorListeners();
           if (pf.scrStream) await publishScreenShare();
+          // Phase 16: camera + in-browser face monitor
+          if (proctorCfg().camera && pf.camStream) {
+            await publishCamera();
+            startFaceMonitor();
+          }
           try {
             if (window.screen && screen.isExtended === true) sendProctor('multi_monitor');
           } catch (e) { }
@@ -4167,8 +4358,10 @@
 
     async function endInterview() {
       endedByUser = true;
-      // PROCTOR: release the screen share + hide any resume banner.
+      // PROCTOR: release the screen share + camera, stop the face monitor.
       if (pf.scrStream) { try { pf.scrStream.getTracks().forEach(t => t.stop()); } catch (e) { } pf.scrStream = null; }
+      if (pf.camStream) { try { pf.camStream.getTracks().forEach(t => t.stop()); } catch (e) { } pf.camStream = null; }
+      stopFaceMonitor();
       showScreenBanner(false);
       if (room) { await room.disconnect(); room = null; }
       stopTimer();

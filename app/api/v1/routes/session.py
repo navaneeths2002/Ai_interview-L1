@@ -114,5 +114,8 @@ async def get_candidate_token(
         "proctor": {
             "enabled":        settings.proctor_enabled,
             "require_screen": settings.proctor_require_screen,
+            # Phase 16 — camera face monitoring (Layer 1, in-browser)
+            "camera":         settings.proctor_camera_enabled,
+            "require_camera": settings.proctor_require_camera,
         },
     }

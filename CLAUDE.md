@@ -482,6 +482,18 @@ Event-driven vision + sparse baseline — Layer 1 (free signals) triggers Layer 
 
 ---
 
+## Camera Proctoring (Phase 16 — Layer 1 only)
+
+Face presence/count monitoring via the candidate's webcam. **Layer 1 only by design** — detection runs in the BROWSER (MediaPipe FaceDetector WASM via CDN, ~1 fps, fully local); the server receives only debounced state-change beacons. Layer-2 camera-frame verification is deliberately NOT built: that slot is reserved for the in-house face-detection service.
+
+- **Preflight**: "Camera" check row — permission + live preview + passes when exactly ONE face is detected (~20s window; degraded mode passes on permission alone if the CDN model can't load). Required gating like screen share (`PROCTOR_REQUIRE_CAMERA`).
+- **During the interview**: camera publishes to the room (`source=Camera`, 640×360@15 — evidence/recording ready for the future service); the browser monitor debounces (3s no-face / 2s multi-face) then sends `face_lost` / `face_returned` / `multiple_faces` / `single_face_restored` / `camera_started` / `camera_stopped` beacons over the `proctor` data channel.
+- **Reactions** (`proctor.py`): `face_lost` → after `PROCTOR_PRESENCE_PROMPT_DELAY_S` (10s) Sarah asks *"Are you still with me?"* (max `PROCTOR_PRESENCE_PROMPTS_MAX`=2, cancelled by `face_returned`); `multiple_faces` joins the SAME warning ladder as vision violations (warn from 2nd, max 2 total).
+- **Report**: section renamed "Screen & Camera Integrity"; `multiple_faces` events appear as violations; scoring: multiple_faces −15 (cap 45), face_lost −4 (cap 20), camera_stopped −10 (cap 30), camera_never_started −30. No migration needed (same `interview_proctor_events` table).
+- **Config**: `PROCTOR_CAMERA_ENABLED`, `PROCTOR_REQUIRE_CAMERA`, `PROCTOR_PRESENCE_PROMPT_DELAY_S`, `PROCTOR_PRESENCE_PROMPTS_MAX`. Tests: `tests/test_camera_proctor.py`.
+
+---
+
 ## Environment Variables (.env)
 
 ```env
@@ -612,6 +624,7 @@ Every table has `tenant_id`. Every API request must include `X-Tenant-ID` header
 | 13 | ✅ Done | Deepgram Flux pipeline — Flux TTS (/v2/speak, conversation-native, `deepgram.TTSv2`) + Flux CSR STT (/v2/listen, model-based end-of-turn, `turn_detection="stt"`), env-flagged with Aura-2/nova-2 rollback |
 | 14 | ✅ Done | Stage-skip fix — intent gate (candidate questions/acks = detours, never answers), detour budget, hardened detectors, evidence trail, persisted counters, async LLM stage verifier (reopen + loop-back), 30-test regression suite |
 | 15 | ✅ Done | Screen proctoring — event-driven vision + sparse baseline: entire-screen share required at preflight, Layer-1 beacons (tab/blur/paste/multi-monitor/share-stop) trigger Layer-2 Haiku vision on a rolling frame buffer, S3 evidence, escalation warnings, `interview_proctor_events` + Screen Integrity report section, 18-test suite |
+| 16 | ✅ Done | Camera proctoring (Layer 1 only) — in-browser MediaPipe face detection (~1 fps, debounced) → face_lost / multiple_faces / camera beacons; Sarah's "are you there?" presence prompts + second-person warnings; camera in preflight + published to room; Screen & Camera Integrity report; Layer-2 camera vision deliberately reserved for the in-house face-detection service; 13-test suite |
 
 ---
 
